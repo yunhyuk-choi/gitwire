@@ -16,8 +16,6 @@ import subprocess
 import threading
 from pathlib import Path
 
-import pytest
-
 import gitwire
 from gitwire.clock import FixedOffsetClock
 

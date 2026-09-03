@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -169,6 +168,16 @@ def test_payload_from_stdin(bare_repo, tmp_path, cli_env):
     p = run_cli(cli_env, "fetch", "--repo", str(bare_repo), "--home", str(home),
                 "--consumer", "r")
     assert payload_of(p)["records"][0]["payload"] == {"from": "stdin"}
+
+
+def test_stdout_json_is_utf8_regardless_of_console_codepage(cli):
+    """윈도우 콘솔 코드페이지(cp949 등)가 표현 못 하는 문자도 그대로 나와야 한다."""
+    cli("init")
+    exotic = {"emoji": "🚀✅", "ko": "한글", "ja": "日本語", "math": "∑∫"}
+    assert cli("append", "--payload", json.dumps(exotic)).returncode == EXIT_OK
+    p = cli("fetch", consumer="utf8")
+    assert p.returncode == EXIT_OK, p.stderr
+    assert payload_of(p)["records"][0]["payload"] == exotic
 
 
 def test_status_reports_cursor_and_remote(cli):

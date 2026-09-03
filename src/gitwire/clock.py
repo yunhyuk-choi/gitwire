@@ -38,8 +38,6 @@ from urllib.parse import urlsplit
 
 #: 기본 재측정 주기(초)
 DEFAULT_REFRESH_INTERVAL = 900.0
-#: 오프셋이 이 값(초)을 넘으면 "시계가 심하게 어긋남"으로 보고 경고 대상
-SUSPICIOUS_OFFSET = 60.0
 
 
 class ClockSource(Protocol):

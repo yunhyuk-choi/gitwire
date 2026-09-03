@@ -2,7 +2,7 @@
 
 출력 규약 — 판단과 근거
 ----------------------
-**stdout 은 언제나 기계가 읽는 JSON 이다. 사람이 읽는 진단·로그는 전부 stderr.**
+**stdout 은 언제나 기계가 읽는 JSON(UTF-8) 이다. 사람이 읽는 진단·로그는 전부 stderr.**
 
 "사람용/기계용을 플래그로 가른다"는 선택지도 있었지만 택하지 않았다. 플래그로
 가르면 호출자가 플래그를 빠뜨린 순간 사람용 텍스트가 파서로 흘러들어가 조용히
@@ -48,8 +48,23 @@ EXIT_USAGE = 2
 EXIT_NO_RECORDS = 10
 
 
+def _force_utf8_streams() -> None:
+    """stdout/stderr 를 UTF-8 로 고정한다.
+
+    윈도우 콘솔은 기본 인코딩이 cp949 같은 로케일 코드페이지다. 그대로 두면
+    같은 명령이 머신마다 다른 바이트를 내보내고, 코드페이지가 표현하지 못하는
+    문자(이모지 등)에서는 UnicodeEncodeError 로 죽는다. 기계가 읽는 계약이
+    로케일에 좌우되면 안 된다 (POLICY-ENCODING 과 같은 취지).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):  # 재설정 불가한 스트림은 그대로 둔다
+            pass
+
+
 def _emit(obj: Any) -> None:
-    """stdout 에 기계용 JSON 한 덩어리."""
+    """stdout 에 기계용 JSON 한 덩어리 (항상 UTF-8)."""
     json.dump(obj, sys.stdout, ensure_ascii=False, indent=None)
     sys.stdout.write("\n")
     sys.stdout.flush()
@@ -328,6 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_streams()
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         stream=sys.stderr,
