@@ -48,6 +48,9 @@ PUSHED_REF = "refs/gitwire/pushed"
 #: 기본 페이지 크기 (역방향 페이징)
 DEFAULT_PAGE = 50
 
+#: 자격증명 메모리 캐시의 기본 수명(초). `credential_cache()` 참조.
+DEFAULT_CREDENTIAL_CACHE_TIMEOUT = 900.0
+
 #: "빈 레포" 로 쳐 주는 파일들. forge 가 새 레포를 만들 때 넣어 주는 것들이라
 #: 이게 있다고 해서 "쓰고 있는 레포"는 아니다.
 EMPTY_REPO_FILES = frozenset({
@@ -65,6 +68,18 @@ def default_sender(home: Path | str | None = None) -> str:
     재시작해도 유지된다.
     """
     return identity.default_sender(home)
+
+
+def credential_cache(
+    timeout: float = DEFAULT_CREDENTIAL_CACHE_TIMEOUT,
+) -> list[str]:
+    """`Channel(credential_helpers=...)` 에 그대로 넘길 수 있는 **메모리 캐시** 사슬.
+
+    git 이 표준으로 제공하는 `credential-cache` 헬퍼 한 줄이다. 무엇을 사고
+    무엇을 파는지는 `Channel._configure_credential_helpers()` 의 주석에 있다 —
+    **켜기 전에 읽어라.** 기본값은 끔(옵트인)이다.
+    """
+    return [f"cache --timeout={max(1, int(timeout))}"]
 
 
 @dataclass(frozen=True)
@@ -137,6 +152,7 @@ class Channel:
         repo_url: str,
         *,
         credential: Credential | None = None,
+        credential_helpers: Sequence[str] | None = None,
         consumer: str = DEFAULT_CONSUMER,
         sender: str | None = None,
         branch: str = DEFAULT_BRANCH,
@@ -156,6 +172,10 @@ class Channel:
         self.branch = branch
         self.name = name
         self.credential = credential or NoCredential()
+        # None = 이 클론의 credential 설정을 **건드리지 않는다** (기본값).
+        self.credential_helpers = (
+            None if credential_helpers is None else list(credential_helpers)
+        )
         # 명시적으로 넘긴 sender 는 그대로 존중한다(하위호환). 없으면 설치본
         # 식별자를 **첫 사용 시점에** 만든다 — 객체 생성만으로 디스크를 건드리지
         # 않게 (`where` 처럼 읽기만 하는 경로가 있다).
@@ -265,6 +285,62 @@ class Channel:
         g.run("config", "user.name", self.author_name)
         g.run("config", "user.email", self.author_email)
         g.run("config", "core.autocrlf", "false")
+        self._configure_credential_helpers()
+
+    def _inherited_credential_helpers(self) -> list[str]:
+        """system·global 에 설정된 helper 목록 (이 클론의 local 은 제외).
+
+        local 을 함께 읽으면 우리가 방금 쓴 값이 다시 섞여 호출마다 사슬이
+        길어진다. 그래서 상위 스코프만 읽는다.
+        """
+        out: list[str] = []
+        for scope in ("--system", "--global"):
+            res = self.git.run(
+                "config", scope, "--get-all", "credential.helper", check=False
+            )
+            if res.returncode == 0:
+                out += [line.strip() for line in res.stdout.splitlines() if line.strip()]
+        return out
+
+    def _configure_credential_helpers(self) -> None:
+        """이 클론의 **로컬** `credential.helper` 사슬을 다시 짠다 (옵트인).
+
+        왜 이런 게 필요한가 — 실측(Windows 11 · git 2.51 · GitHub private repo,
+        같은 머신에서 5회씩)::
+
+            helper 사슬                       ls-remote 1회 (중앙값)
+            manager(=GCM, 시스템 기본)                 1320 ms
+            cache --timeout=900 → manager               1167 ms
+            cache --timeout=900 (단독, 캐시 적중)         910 ms
+
+        즉 **GCM 조회·저장이 왕복당 약 400ms** 다 (`git credential-manager get`
+        은 셸 + .NET 프로세스를 새로 띄운다). 남는 ~900ms 는 GCM 과 무관한
+        고정비다 — `ls-remote` 는 private repo 에 HTTPS 왕복을 3번 한다
+        (①익명 GET → 401 ②인증 GET → 200 ③protocol-v2 ls-refs POST) + 프로세스
+        기동. 그래서 **캐시로 지울 수 있는 것은 1.3초 중 0.4초뿐이다.**
+
+        ⚠️ 무엇을 파는가 (켜기 전에 알아야 할 것):
+
+        * `git-credential-cache` 는 **자격증명을 데몬 프로세스의 메모리에**
+          timeout 동안 들고 있는다. 디스크에는 쓰지 않지만, 그 시간 동안
+          같은 OS 사용자로 도는 프로세스는 소켓을 통해 꺼내 쓸 수 있다.
+          짧게 잡을수록 노출 창이 좁고, 대신 왕복마다 상위 helper 로 되돌아간다.
+        * 그래서 **기본값은 끔**이다. 켜는 쪽이 명시해야 한다.
+
+        무엇을 사지 않는가 — 이 설정은 **이 클론의 `.git/config` 에만** 쓴다.
+        사용자의 global·system 설정은 읽기만 하고 절대 고치지 않는다.
+        상속된 helper 는 사슬 **뒤에** 그대로 남겨서, 캐시가 비었을 때 원래대로
+        GCM 이 채워 준다 (첫 왕복의 동작이 바뀌지 않는다).
+        """
+        helpers = self.credential_helpers
+        if helpers is None:
+            return                      # 기본 — 아무것도 쓰지 않는다
+        inherited = [h for h in self._inherited_credential_helpers() if h not in helpers]
+        g = self.git
+        # 빈 값 하나가 "여기서부터 목록을 새로 센다"는 git 의 규약이다.
+        g.run("config", "--local", "--replace-all", "credential.helper", "", check=False)
+        for helper in list(helpers) + inherited:
+            g.run("config", "--local", "--add", "credential.helper", helper, check=False)
 
     def _has_head(self) -> bool:
         return self.git.ok("rev-parse", "--verify", "--quiet", "HEAD")
@@ -480,6 +556,43 @@ class Channel:
                 self._fetch()
                 self._integrate()
             return self._head()
+
+    def local_head(self) -> str | None:
+        """원격을 **보지 않고** 로컬 클론의 HEAD 만 돌려준다 (원격 왕복 0회).
+
+        `sync()` 와 짝이다. 둘의 차이가 곧 읽기 API 의 `fresh=` 가 파는 것이다 —
+        아래 「신선도 정책」 참조.
+        """
+        with self._lock:
+            self.open()
+            return self._head()
+
+    def _read_head(self, fresh: bool) -> str | None:
+        """읽기 API 가 기준으로 삼을 커밋.
+
+        ⭐ **신선도 정책 — 읽기는 원격을 볼 필요가 없다.**
+
+        `fresh=True` (기본, 하위호환) 는 `sync()` 를 탄다: `ls-remote` 로 원격
+        SHA 를 물어보고, 다르면 fetch·통합한다. 실측(Windows 11 · git 2.51 ·
+        GitHub private repo) `ls-remote` 한 번이 **1.3초**다 — 네트워크 왕복
+        자체는 100ms 대이고 나머지는 자격증명 헬퍼 + HTTPS 왕복 3회 + 프로세스
+        기동이다. 반면 같은 데이터를 **로컬 클론에서** 읽는 비용은 40~110ms 다.
+
+        `fresh=False` 는 그 왕복을 통째로 없앤다. 정당한 이유는 두 가지다:
+
+        * **레코드는 이미 로컬에 있다.** 채널은 클론이다. 원격에 물어봐야 알 수
+          있는 것은 "그 뒤에 새 것이 더 있나" 뿐이고, 그건 이미 **구독(폴러)**
+          이 맡고 있다 — `subscribe()` 가 주기마다 `sync()` 를 탄다. 읽기까지
+          원격을 보면 같은 일을 두 곳에서 한다.
+        * **과거로 거슬러 올라가는 페이징은 원격과 무관하다.** 이미 받은
+          커밋 안에서 뒤로 가는 것이므로 원격을 확인할 이유가 아예 없다.
+
+        바뀌는 의미는 하나뿐이다: `fresh=False` 로 읽은 결과는 **마지막 폴 시점**
+        기준이다. 그 지연이 곤란한 순간(예: 방을 지금 막 열었다)이 있으면
+        소비자가 그때만 `fresh=True` 를 쓰거나, 화면을 막지 않고 별도로
+        당기면 된다 (gitwire-chat 이 후자를 택했다).
+        """
+        return self.sync() if fresh else self.local_head()
 
     def recover(self, discard_local: bool = False) -> None:
         """히스토리 재작성 후 복구. discard_local=True 면 미푸시 커밋을 버린다."""
@@ -836,7 +949,11 @@ class Channel:
             return True
 
     def history(
-        self, limit: int | None = None, *, before: str | None = None
+        self,
+        limit: int | None = None,
+        *,
+        before: str | None = None,
+        fresh: bool = True,
     ) -> list[records.Record]:
         """커서와 무관하게 레코드를 시간순으로 읽는다.
 
@@ -845,26 +962,37 @@ class Channel:
 
         어느 쪽이든 **요청한 N건의 blob 만** 연다. "더 있는가"까지 알아야 하면
         `history_page()` 를 쓴다.
+
+        `fresh=False` 면 원격을 보지 않고 로컬 클론만 읽는다 (`_read_head()` 의
+        「신선도 정책」).
         """
         with self._lock:
-            head = self.sync()
+            head = self._read_head(fresh)
             if head is None:
                 return []
             paths = self._ids_before(head, before, limit)
             return [r for r in (self._read_record(p, head) for p in paths) if r]
 
     def history_page(
-        self, *, before: str | None = None, limit: int = DEFAULT_PAGE
+        self,
+        *,
+        before: str | None = None,
+        limit: int = DEFAULT_PAGE,
+        fresh: bool = True,
     ) -> HistoryPage:
         """⭐ 역방향 페이징 한 쪽 — `HistoryPage(records, has_more)`.
 
         `before=None` 이면 최신 쪽 한 쪽. 다음 쪽은 `before=page.oldest` 로 잇는다.
         `has_more` 는 **한 건을 더 나열해 보고**(blob 은 열지 않는다) 판정한다 —
         소비자가 빈 페이지를 받아보고서야 끝을 아는 일이 없게.
+
+        `fresh=False` 면 원격을 보지 않고 로컬 클론만 읽는다 (`_read_head()` 의
+        「신선도 정책」). 페이지 경계·중복/누락 없음은 그대로다 — keyset 커서는
+        기준 커밋이 무엇이든 성립한다.
         """
         n = max(1, int(limit))
         with self._lock:
-            head = self.sync()
+            head = self._read_head(fresh)
             if head is None:
                 return HistoryPage([], False)
             ids = self._ids_before(head, before, n + 1)
@@ -875,7 +1003,11 @@ class Channel:
             return HistoryPage(recs, has_more)
 
     def record_ids(
-        self, *, before: str | None = None, limit: int | None = None
+        self,
+        *,
+        before: str | None = None,
+        limit: int | None = None,
+        fresh: bool = True,
     ) -> list[str]:
         """레코드 **ID 만** 시간순으로 나열한다 (payload blob 을 열지 않는다).
 
@@ -883,9 +1015,12 @@ class Channel:
         것은 "전량 나열"이 아니라 **커서 기준 열거**이고, 전량 나열을 공개하면
         비싼 경로가 기본이 된다. 인덱스·동기화 상태 확인처럼 payload 가 필요 없는
         용도를 위한 API 다.
+
+        `fresh=False` 면 원격을 보지 않고 로컬 클론만 읽는다 (`_read_head()` 의
+        「신선도 정책」).
         """
         with self._lock:
-            head = self.sync()
+            head = self._read_head(fresh)
             if head is None:
                 return []
             return self._ids_before(head, before, limit)

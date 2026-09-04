@@ -157,14 +157,15 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 
 def cmd_history(args: argparse.Namespace) -> int:
+    fresh = not args.local
     with _channel(args) as ch:
         if args.limit:
             # 페이지 요청 — 다음 쪽 커서(`oldest`)와 종료 조건(`has_more`)까지 준다.
-            page = ch.history_page(before=args.before, limit=args.limit)
+            page = ch.history_page(before=args.before, limit=args.limit, fresh=fresh)
             recs, has_more = page.records, page.has_more
         else:
             # limit 없이는 예전과 같이 (before 이전) 전량이다 → 더 있을 수 없다.
-            recs = ch.history(before=args.before)
+            recs = ch.history(before=args.before, fresh=fresh)
             has_more = False
         if args.ndjson:
             for r in recs:
@@ -176,6 +177,7 @@ def cmd_history(args: argparse.Namespace) -> int:
                     "command": "history",
                     "count": len(recs),
                     "before": args.before,
+                    "local": bool(args.local),
                     "oldest": recs[0].id if recs else None,
                     "has_more": has_more,
                     "records": [r.to_dict() for r in recs],
@@ -321,6 +323,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--before",
         default=None,
         help="이 레코드 ID 직전부터 거슬러 읽는다 (keyset 커서 — 앞 응답의 oldest)",
+    )
+    sp.add_argument(
+        "--local",
+        action="store_true",
+        help="원격을 보지 않고 로컬 클론만 읽는다 (ls-remote 왕복 0회 — "
+             "과거로 거슬러 올라가는 페이징처럼 신선도가 필요 없는 경우)",
     )
     sp.add_argument("--ndjson", action="store_true")
     sp.set_defaults(func=cmd_history)

@@ -93,15 +93,21 @@ ch.ack_through(recs[-1].id)       # 처리한 데까지만 전진
 "이전 불러오기"·무한 스크롤처럼 **뒤로 가는** 소비자를 위한 표면이다.
 
 ```python
-page = ch.history_page(limit=50)              # 최신 50건
-while page.has_more:                          # 종료 조건을 소비자가 알 수 있다
-    page = ch.history_page(before=page.oldest, limit=50)   # 그 앞 50건
+page = ch.history_page(limit=50, fresh=False)          # 최신 50건 (로컬만)
+while page.has_more:                                   # 종료 조건을 소비자가 알 수 있다
+    page = ch.history_page(before=page.oldest, limit=50, fresh=False)  # 그 앞 50건
 ```
 
 `history(before=..., limit=N)` 는 레코드 리스트만, `history_page()` 는 거기에
 `has_more` 를 얹어 준다. ID 만 필요하면 `record_ids(before=..., limit=N)`
 (payload blob 을 열지 않는다). 나열 결과는 sha 로 캐시되므로 같은 상태를 반복
 조회하면 git 호출이 0회다 — 상태는 `channel.cache_info()` 로 볼 수 있다.
+
+**`fresh=` — 지금 신선도가 필요한가.** 세 읽기 API(`history` · `history_page` ·
+`record_ids`)가 모두 받는다. `fresh=True`(기본, 하위호환)는 `ls-remote` 로 원격을
+먼저 확인하고, `fresh=False` 는 **로컬 클론만** 읽어 원격 왕복을 0회로 만든다.
+실측 차이가 **왕복 1.3초 대 0**이라 이 선택이 곧 체감 성능이다 — 근거와 언제
+무엇을 골라야 하는지는 아래 「읽기는 원격을 볼 필요가 없다」.
 
 **keyset 커서다 — offset(`skip=100`) 이 아니다.** 위로 읽는 도중 새 레코드가
 도착하면 offset 방식은 경계가 밀려 **같은 레코드를 두 번 주거나 빠뜨린다.**
@@ -121,7 +127,7 @@ python -m gitwire fetch  --repo ... --consumer agent
 | `init` | **빈 레포**에 규약(디렉토리 + 첫 커밋)을 심는다. 주소만 넣으면 방이 된다 (내용이 있는 레포는 거부한다 — 아래 「빈 레포만」) |
 | `status` | 채널·커서 상태 + 원격 SHA 조회 |
 | `fetch` | 지난번 이후 새 레코드 (기본: 커서 전진). `--limit` `--no-advance` `--from-now` `--ndjson` |
-| `history` | 커서와 무관하게 읽기. `--limit N` `--before <레코드ID>` 로 역방향 페이징 (응답에 `oldest`·`has_more`) |
+| `history` | 커서와 무관하게 읽기. `--limit N` `--before <레코드ID>` 로 역방향 페이징 (응답에 `oldest`·`has_more`). `--local` 이면 원격을 보지 않고 로컬 클론만 읽는다 |
 | `append` | 레코드 발행. `--payload JSON` 또는 `--payload-file -`(stdin). 응답에 `id`·`sender`·`ts` |
 | `ack` | `--record-id` 까지 커서 전진 (`fetch --no-advance` 와 짝) |
 | `watch` | 상시 구독 → NDJSON 스트림 (`--max-records` 로 N건 뒤 종료) |
@@ -168,6 +174,73 @@ git 호출에는 `GIT_TERMINAL_PROMPT=0` 이 항상 걸린다.
 실측: `git ls-remote origin HEAD` = **613~646ms · 46바이트**, `fetch`(변경
 없을 때) = **718~752ms**. 30초 주기면 하루 약 130KB. 조용한 채널일수록 이
 선판정이 이득이다. 브랜치와 HEAD 를 **한 번의 왕복**으로 같이 묻는다.
+
+⚠️ 저 613ms 는 인증이 캐시된 조건의 값이다. 실제 환경(Windows 11 · git 2.51 ·
+GitHub private repo)에서 **자격증명 헬퍼까지 포함한 왕복은 1.3초**다 — 분해는
+아래 「자격증명 조회 비용」.
+
+### 읽기는 원격을 볼 필요가 없다 (`fresh=`)
+
+예전에는 `history()` · `history_page()` · `record_ids()` 가 **매 호출** `sync()`
+를 탔다. 즉 "이전 50건 보여줘" 한 번에 `ls-remote` 왕복이 한 번씩 붙었다.
+실측(같은 머신·같은 레포, 5회 중앙값):
+
+| | 시간 |
+|---|---|
+| `git ls-remote origin refs/heads/main HEAD` | **1320 ms** |
+| 로컬 나열 `git ls-tree -r --name-only HEAD` | **44 ms** |
+
+그럴 이유가 없다. **채널은 클론이다 — 레코드는 이미 로컬에 있다.** 원격에
+물어봐야 알 수 있는 것은 "그 뒤에 새 것이 더 있나" 하나뿐이고, 그건 이미
+**구독(`subscribe`)** 이 주기마다 하고 있다. 읽기까지 원격을 보면 같은 일을 두
+곳에서 한다. 특히 **과거로 거슬러 올라가는 페이징은 원격과 아예 무관하다** —
+이미 받은 커밋 안에서 뒤로 가는 것이기 때문이다.
+
+그래서 세 읽기 API 에 `fresh=` 를 두어 **소비자가 고르게** 했다. 기본값은
+`True`(기존 동작 그대로)이고, `fresh=False` 가 로컬 전용 모드다.
+
+바뀌는 의미는 정확히 하나다: `fresh=False` 결과는 **마지막 폴 시점** 기준이다.
+그러니 신선도가 필요한 순간(예: 방을 지금 막 열었다)에는 소비자가
+① `fresh=True` 를 쓰거나 ② 화면을 막지 않고 따로 당기면 된다. 이 성질은
+`tests/test_local_reads.py` 가 세 각도로 못 박는다 — 로컬 읽기는 `ls-remote`
+0회, 페이지 계약(중복·누락·경계)은 그대로, 그리고 **남이 방금 push 한 것은
+폴이 돌기 전까지 안 보인다.**
+
+### 자격증명 조회 비용 — 줄일 수 있는 만큼만, 옵트인으로
+
+`ls-remote` 1.3초를 `GIT_TRACE` 로 뜯으면 이렇다 (Windows 11 · git 2.51 ·
+GitHub private repo):
+
+* git 이 왕복마다 `git credential-manager get`(그리고 성공 후 `store`)을
+  **셸 + .NET 프로세스로 새로 띄운다.**
+* `ls-remote` 는 private repo 에 HTTPS 왕복을 **3번** 한다 — ①익명 GET → 401
+  ②인증 GET → 200 ③protocol-v2 `ls-refs` POST.
+
+helper 사슬만 바꿔 가며 잰 값 (5회 중앙값):
+
+| helper 사슬 | ls-remote 1회 |
+|---|---|
+| `manager` (시스템 기본, GCM) | **1320 ms** |
+| `cache --timeout=900` → `manager` | **1167 ms** |
+| `cache --timeout=900` 단독 (캐시 적중) | **910 ms** |
+
+즉 **GCM 이 왕복당 약 400ms**이고, 남는 ~900ms 는 helper 와 무관한 고정비다
+(HTTPS 왕복 3회 + 프로세스 기동). 캐시로 지울 수 있는 것은 1.3초 중 0.4초뿐이다.
+
+400ms 는 공짜가 아니라 **거래**다: `git-credential-cache` 는 자격증명을 데몬
+프로세스의 **메모리에** timeout 동안 들고 있고, 그동안 같은 OS 사용자로 도는
+프로세스가 소켓으로 꺼내 쓸 수 있다. 디스크에는 쓰지 않는다.
+
+그래서 규칙을 이렇게 정했다:
+
+* **기본값은 끔.** `Channel(credential_helpers=...)` 를 명시해야 켜진다
+  (`gitwire.credential_cache(초)` 가 사슬 한 벌을 만들어 준다).
+* **쓰는 곳은 이 클론의 `.git/config` 뿐이다.** 사용자의 global·system 설정은
+  읽기만 하고 절대 고치지 않는다.
+* **상속된 helper 를 사슬 뒤에 남긴다.** 캐시가 비면 원래대로 GCM 이 채워 주므로
+  첫 왕복의 동작이 바뀌지 않는다.
+* 읽기가 `fresh=False` 로 바뀐 뒤 이 비용이 남는 곳은 **백그라운드 폴러뿐**이라
+  사람이 기다리는 경로가 아니다. 그래서 켤 가치가 있는지는 소비자가 판단한다.
 
 ### 레코드 1건 = 파일 1개
 
@@ -277,7 +350,8 @@ git subprocess 한 번은 하는 일과 무관하게 **42~48ms** 다 — `rev-pa
 
 실측(5000건 방에서 50건씩 5쪽 거슬러 올라가기): 쪽당 `ls-tree` **2회 → 0회**
 (첫 쪽만 2회), 쪽당 **297ms → 187ms**, 5쪽 합계 **1488ms → 1035ms**.
-남은 바닥은 쪽마다 도는 `sync()`(ls-remote 1 + rev-parse 2)다.
+남은 바닥은 쪽마다 도는 `sync()`(ls-remote 1 + rev-parse 2)였는데, 그건
+`fresh=False` 가 없앴다 — 위 「읽기는 원격을 볼 필요가 없다」.
 
 ### 배칭 — 커밋 폭증 억제
 

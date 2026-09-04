@@ -22,9 +22,10 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
         print(rec.id, rec.payload)
 
     # 역방향 페이징 (과거로 거슬러 올라가는 소비자 — 무한 스크롤 등)
-    page = ch.history_page(limit=50)
+    # fresh=False = 원격을 보지 않고 로컬 클론만 읽는다 (신선도는 구독이 맡는다)
+    page = ch.history_page(limit=50, fresh=False)
     while page.has_more:
-        page = ch.history_page(before=page.oldest, limit=50)
+        page = ch.history_page(before=page.oldest, limit=50, fresh=False)
 
     # 상시 구독 (루프를 도는 소비자 — 웹앱 등)
     sub = ch.subscribe(lambda rec: print(rec.payload))
@@ -33,11 +34,13 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
 from .channel import (
     DEFAULT_BATCH_WINDOW,
     DEFAULT_BRANCH,
+    DEFAULT_CREDENTIAL_CACHE_TIMEOUT,
     DEFAULT_PAGE,
     DEFAULT_POLL_INTERVAL,
     Channel,
     HistoryPage,
     Subscription,
+    credential_cache,
     open_channel,
 )
 from .clock import FixedOffsetClock, HttpDateClock, SystemClock
@@ -73,6 +76,7 @@ __all__ = [
     "Credential",
     "NoCredential",
     "TokenCredential",
+    "credential_cache",
     # 시계
     "SystemClock",
     "HttpDateClock",
@@ -102,4 +106,5 @@ __all__ = [
     "DEFAULT_POLL_INTERVAL",
     "DEFAULT_BATCH_WINDOW",
     "DEFAULT_PAGE",
+    "DEFAULT_CREDENTIAL_CACHE_TIMEOUT",
 ]
