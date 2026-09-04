@@ -37,6 +37,7 @@ from .channel import (
     DEFAULT_CREDENTIAL_CACHE_TIMEOUT,
     DEFAULT_PAGE,
     DEFAULT_POLL_INTERVAL,
+    DEFAULT_ROLLUP_INTERVAL,
     Channel,
     HistoryPage,
     Subscription,
@@ -60,6 +61,13 @@ from .hub import Hub
 from .identity import installation_id
 from .layout import channel_dir, gitwire_home, normalize_repo_url
 from .records import Record
+from .rollup import (
+    ARCHIVE_DIR,
+    DEFAULT_GRACE_HOURS,
+    DEFAULT_MIN_RECORDS,
+    ArchiveFormatError,
+    archive_path,
+)
 
 __version__ = "0.2.0"
 
@@ -101,6 +109,13 @@ __all__ = [
     "ChannelInitError",
     "HistoryRewritten",
     "ClockError",
+    "ArchiveFormatError",
+    # 지난 날짜 롤업 (비파괴 — compact 와 다르다)
+    "ARCHIVE_DIR",
+    "archive_path",
+    "DEFAULT_GRACE_HOURS",
+    "DEFAULT_MIN_RECORDS",
+    "DEFAULT_ROLLUP_INTERVAL",
     # 기본값
     "DEFAULT_BRANCH",
     "DEFAULT_POLL_INTERVAL",

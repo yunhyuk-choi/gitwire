@@ -41,6 +41,7 @@ git 오브젝트는 내용 주소다 — **같은 sha 면 내용이 반드시 �
 
 from __future__ import annotations
 
+import threading
 from collections import OrderedDict
 
 #: 캐시에 담아 두는 경로 문자열 수 상한 (실측 109 B/개 → 약 2MB)
@@ -48,49 +49,60 @@ DEFAULT_MAX_ITEMS = 20_000
 
 
 class TreeCache:
-    """sha → 나열 결과. 스레드 안전성은 호출자(Channel._lock)가 준다."""
+    """sha → 나열 결과.
+
+    **자체 잠금을 쥔다.** 예전에는 채널 락이 상호배제를 대신했지만, 지난 날짜
+    롤업이 배경 스레드에서 *채널 락을 쥐지 않은 채* 나열을 읽으므로(락을 오래
+    쥐지 않는 것이 그 기능의 요구사항이다) 캐시가 스스로 안전해야 한다.
+    경합이 없을 때 락 비용은 수십 ns 라 측정에 잡히지 않는다.
+    """
 
     def __init__(self, max_items: int = DEFAULT_MAX_ITEMS) -> None:
         self.max_items = max(0, int(max_items))
         self._items: "OrderedDict[str, list[str]]" = OrderedDict()
         self._size = 0
+        self._lock = threading.Lock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
 
     def get(self, key: str) -> list[str] | None:
-        value = self._items.get(key)
-        if value is None:
-            self.misses += 1
-            return None
-        self._items.move_to_end(key)      # LRU
-        self.hits += 1
-        return value
+        with self._lock:
+            value = self._items.get(key)
+            if value is None:
+                self.misses += 1
+                return None
+            self._items.move_to_end(key)      # LRU
+            self.hits += 1
+            return value
 
     def put(self, key: str, value: list[str]) -> list[str]:
         if not self.max_items:
             return value
-        old = self._items.pop(key, None)
-        if old is not None:
-            self._size -= len(old)
-        self._items[key] = value
-        self._size += len(value)
-        while self._items and self._size > self.max_items:
-            _, dropped = self._items.popitem(last=False)
-            self._size -= len(dropped)
-            self.evictions += 1
-        return value
+        with self._lock:
+            old = self._items.pop(key, None)
+            if old is not None:
+                self._size -= len(old)
+            self._items[key] = value
+            self._size += len(value)
+            while self._items and self._size > self.max_items:
+                _, dropped = self._items.popitem(last=False)
+                self._size -= len(dropped)
+                self.evictions += 1
+            return value
 
     def clear(self) -> None:
-        self._items.clear()
-        self._size = 0
+        with self._lock:
+            self._items.clear()
+            self._size = 0
 
     def info(self) -> dict:
-        return {
-            "entries": len(self._items),
-            "items": self._size,
-            "max_items": self.max_items,
-            "hits": self.hits,
-            "misses": self.misses,
-            "evictions": self.evictions,
-        }
+        with self._lock:
+            return {
+                "entries": len(self._items),
+                "items": self._size,
+                "max_items": self.max_items,
+                "hits": self.hits,
+                "misses": self.misses,
+                "evictions": self.evictions,
+            }
