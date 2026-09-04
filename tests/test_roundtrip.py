@@ -50,13 +50,15 @@ def test_a_appends_b_receives(participant):
     a = participant("alice")
     b = participant("bob")
 
-    rid = a.append({"kind": "hello", "n": 1})
+    sent = a.append({"kind": "hello", "n": 1})
     a.flush()
 
     got = b.fetch_new()
-    assert [r.id for r in got] == [rid]
+    assert [r.id for r in got] == [sent.id]
     assert got[0].payload == {"kind": "hello", "n": 1}
     assert got[0].sender == "alice"
+    # 발행한 쪽이 받은 Record 와 받은 쪽의 Record 가 **같은 봉투**다.
+    assert got[0] == sent
 
     # 두 번째 호출에는 아무것도 없다 (중복 없음)
     assert b.fetch_new() == []

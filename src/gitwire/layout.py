@@ -54,7 +54,7 @@ _SLUG_RE = re.compile(r"[^a-z0-9_.-]+")
 
 _REPO_README = """# gitwire 채널 레포
 
-이 레포는 [gitwire](https://example.invalid/gitwire) 가 **전송 계층**으로 쓰는
+이 레포는 [gitwire](https://github.com/yunhyuk-choi/gitwire) 가 **전송 계층**으로 쓰는
 저장소다. 사람이 직접 편집하지 않는다.
 
 * `records/<날짜>/*.json` — append-only 레코드. 한 건 = 한 파일. 수정·삭제하지 않는다.

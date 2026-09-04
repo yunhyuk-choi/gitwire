@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from gitwire import clock, credentials, gitcmd, layout, records
+from gitwire import clock, credentials, gitcmd, identity, layout, records
 from gitwire.cursor import Cursor, CursorStore
 from gitwire.errors import AuthError, GitError, PushRejected
 
@@ -43,7 +43,76 @@ def test_sender_slug_is_filename_safe():
     assert records.slug_sender("alice/bob") == "alice_bob"
     assert records.slug_sender("a-b") == "a_b"          # '-' 는 구분자라 제거
     assert records.slug_sender("  ") == "anon"
-    assert len(records.slug_sender("x" * 100)) <= 24
+    assert len(records.slug_sender("x" * 100)) <= records.MAX_SENDER_LEN
+    # 설치본 식별자는 `<git 이메일>.<난수>` 라 '@' 가 살아남아야 한다. 잘리면
+    # **난수 접미까지 함께 잘려** 두 설치본이 같은 슬러그가 될 수 있다.
+    assert records.slug_sender("me@example.com.a3f9c1") == "me@example.com.a3f9c1"
+
+
+# -------------------------------------------------------------- identity
+
+
+class _StubRunner:
+    """git 을 부르지 않는 실행기 (설치본 식별자 씨앗 주입점)."""
+
+    def __init__(self, stdout: str = "", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+        self.calls: list[list[str]] = []
+
+    def run(self, args, *, cwd=None, env=None, timeout=None):
+        self.calls.append(list(args))
+        return gitcmd.GitResult(self.returncode, self.stdout, "")
+
+
+def test_installation_id_is_seeded_by_git_email(tmp_path):
+    runner = _StubRunner("  yh.choi@example.com  ")   # 앞뒤 공백은 다듬어진다
+    value = identity.installation_id(tmp_path / "home", runner=runner)
+    assert runner.calls == [["config", "--get", "user.email"]]
+    assert value.startswith("yh.choi@example.com.")   # 사람이 알아볼 수 있다
+    assert len(value) <= records.MAX_SENDER_LEN
+    # 파일명 슬러그를 통과해도 값이 그대로다 (= 봉투와 파일명이 어긋나지 않는다)
+    assert records.slug_sender(value) == value
+
+
+def test_installation_id_falls_back_without_git_identity(tmp_path):
+    """git 전역 설정이 없는 환경(CI·컨테이너)도 정상 경로다."""
+    value = identity.installation_id(tmp_path / "home", runner=_StubRunner("", 1))
+    assert value.rsplit(".", 1)[0] == records.slug_sender(identity.local_seed())
+    assert len(value.rsplit(".", 1)[1]) == 6
+
+
+def test_installation_id_persists_and_differs_per_installation(tmp_path):
+    """⭐ A 의 핵심: 재시작해도 유지되고, 같은 머신의 두 설치본은 갈린다."""
+    runner = _StubRunner("me@example.com")
+    first = identity.installation_id(tmp_path / "A", runner=runner)
+    again = identity.installation_id(tmp_path / "A", runner=runner)   # 재시작 흉내
+    other = identity.installation_id(tmp_path / "B", runner=runner)
+
+    assert first == again, "재시작하면 신원이 바뀐다"
+    assert first != other, "같은 머신의 두 설치본이 같은 신원을 갖는다"
+    marker = tmp_path / "A" / identity.INSTALLATION_FILE
+    raw = marker.read_bytes()
+    assert raw.decode("utf-8").strip() == first
+    assert bytes([13, 10]) not in raw                       # LF 고정
+    assert not raw.startswith(bytes([0xEF, 0xBB, 0xBF]))    # BOM 없음
+
+
+def test_installation_id_survives_unwritable_home(tmp_path, monkeypatch):
+    """저장 못 하는 환경에서도 죽지 않는다 (그 프로세스 한정 값으로 degraded)."""
+    def boom(*args, **kwargs):
+        raise OSError("read-only")
+
+    monkeypatch.setattr(identity, "open", boom, raising=False)
+    value = identity.installation_id(tmp_path / "ro", runner=_StubRunner("", 1))
+    assert value and records.slug_sender(value) == value
+
+
+def test_explicit_sender_env_wins(tmp_path, monkeypatch):
+    """하위호환 — 명시적으로 준 값은 그대로 존중한다."""
+    monkeypatch.setenv("GITWIRE_SENDER", "고정-이름")
+    assert identity.default_sender(tmp_path) == records.slug_sender("고정-이름")
+    assert not (tmp_path / identity.INSTALLATION_FILE).exists()
 
 
 def test_envelope_roundtrip_keeps_payload_opaque():

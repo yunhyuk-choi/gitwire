@@ -10,18 +10,16 @@ append-only 레코드를 주고받는다. egress(pull/push)만 쓰므로 인바�
 
 from __future__ import annotations
 
-import getpass
 import logging
-import os
-import socket
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from . import clock as _clock
-from . import layout, records
+from . import identity, layout, records
 from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
 from .errors import ChannelInitError, GitError, HistoryRewritten, PushRejected
@@ -46,20 +44,46 @@ MODE_SCAN = "scan"   # 전량 나열 + 워터마크 (첫 소비 / 히스토리 �
 PUSHED_REF = "refs/gitwire/pushed"
 
 
-def default_sender() -> str:
-    """참가자(프로세스) 식별자. 표시용 신원이 아니라 전송 수준 식별자다."""
-    env = os.environ.get("GITWIRE_SENDER")
-    if env:
-        return records.slug_sender(env)
-    try:
-        user = getpass.getuser()
-    except Exception:
-        user = "anon"
-    try:
-        host = socket.gethostname().split(".")[0]
-    except Exception:
-        host = "local"
-    return records.slug_sender(f"{user}.{host}")
+#: 기본 페이지 크기 (역방향 페이징)
+DEFAULT_PAGE = 50
+
+
+def default_sender(home: Path | str | None = None) -> str:
+    """설치본 식별자(= 전송 수준 `sender`). 표시용 신원이 아니다.
+
+    규칙과 근거는 `identity.py` — 요약하면 `<git 이메일>.<난수6>` 을 한 번 만들어
+    `<home>/installation.txt` 에 영속시킨다. 같은 머신의 두 설치본이 갈리고,
+    재시작해도 유지된다.
+    """
+    return identity.default_sender(home)
+
+
+@dataclass(frozen=True)
+class HistoryPage:
+    """역방향 페이징 한 쪽.
+
+    `has_more` 가 있어야 소비자가 **무한 스크롤의 종료 조건**을 안다 — 빈 페이지를
+    한 번 더 받아보는 식으로 알아내게 두면 맨 위에서 헛요청이 한 번씩 더 나간다.
+    """
+
+    records: list[records.Record]
+    has_more: bool
+    """`before` 로 준 커서보다 더 앞선 레코드가 아직 남아 있나."""
+
+    @property
+    def oldest(self) -> str | None:
+        """다음 페이지의 `before` 로 그대로 쓰는 값."""
+        return self.records[0].id if self.records else None
+
+    @property
+    def newest(self) -> str | None:
+        return self.records[-1].id if self.records else None
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def __iter__(self):
+        return iter(self.records)
 
 
 class Subscription:
@@ -123,7 +147,10 @@ class Channel:
         self.branch = branch
         self.name = name
         self.credential = credential or NoCredential()
-        self.sender = records.slug_sender(sender or default_sender())
+        # 명시적으로 넘긴 sender 는 그대로 존중한다(하위호환). 없으면 설치본
+        # 식별자를 **첫 사용 시점에** 만든다 — 객체 생성만으로 디스크를 건드리지
+        # 않게 (`where` 처럼 읽기만 하는 경로가 있다).
+        self._sender: str | None = records.slug_sender(sender) if sender else None
         self.poll_interval = poll_interval
         self.batch_window = batch_window
         self.max_batch = max_batch
@@ -131,7 +158,8 @@ class Channel:
         self.author_name = author_name
         self.author_email = author_email
 
-        self.dir = layout.channel_dir(repo_url, home)
+        self.home = Path(home) if home is not None else layout.gitwire_home()
+        self.dir = layout.channel_dir(repo_url, self.home)
         self.clone_dir = self.dir / "clone"
         self.cursors = CursorStore(self.dir, consumer)
         self.consumer = self.cursors.consumer
@@ -155,6 +183,23 @@ class Channel:
                 if base
                 else _clock.SystemClock()
             )
+
+    # -------------------------------------------------------------- 신원
+
+    @property
+    def sender(self) -> str:
+        """이 설치본의 전송 수준 식별자 (표시용 이름이 아니다).
+
+        `sender=` 를 명시하지 않았으면 `<home>/installation.txt` 의 설치본
+        식별자를 쓴다(없으면 만든다) — `identity.py` 참조.
+        """
+        if self._sender is None:
+            self._sender = identity.default_sender(self.home, runner=self._runner)
+        return self._sender
+
+    @sender.setter
+    def sender(self, value: str) -> None:
+        self._sender = records.slug_sender(value)
 
     # ------------------------------------------------------------------ git
 
@@ -403,10 +448,16 @@ class Channel:
         *,
         sender: str | None = None,
         flush: bool = False,
-    ) -> str:
-        """레코드 1건을 발행한다. 반환값은 레코드 ID.
+    ) -> records.Record:
+        """레코드 1건을 발행한다. **반환값은 방금 만든 `Record`** 다.
 
         payload 는 **불투명한 JSON** 이다 — gitwire 는 내용을 해석하지 않는다.
+
+        ⚠️ ID 만 돌려주던 시절에는 소비자가 `sender`·`timestamp` 를 알려면 ID
+        문자열을 되파싱해야 했다. 그 과정에서 파일명의 밀리초 절삭 때문에
+        마이크로초 정밀도가 깎이고, 봉투 규약이 소비자 쪽으로 새어 나갔다.
+        발행한 쪽은 이미 세 값을 다 알고 있으므로 그대로 돌려주는 것이 옳다
+        (로컬 에코를 그리는 소비자에게 필수다).
 
         파일은 즉시 디스크에 쓰이고(내구성), 커밋·push 는 배칭 창(batch_window)
         안의 여러 건을 묶어 한 커밋으로 나간다. `flush=True` 면 즉시 밀어낸다.
@@ -419,6 +470,10 @@ class Channel:
             path = self.clone_dir / rid
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(records.encode(rid, who, ts, payload))
+            record = records.Record(
+                id=rid, sender=who, timestamp=ts.astimezone(timezone.utc),
+                payload=payload,
+            )
             self._pending.append(rid)
             if self._pending_since is None:
                 self._pending_since = time.monotonic()
@@ -430,7 +485,7 @@ class Channel:
                 self._flush_cv.notify_all()
         if need_now:
             self.flush()
-        return rid
+        return record
 
     def _ensure_flusher(self) -> None:
         if self._flusher and self._flusher.is_alive():
@@ -496,6 +551,11 @@ class Channel:
     # ----------------------------------------------------------------- 읽기
 
     def _list_records(self, ref: str) -> list[str]:
+        """레코드 경로 **전량**. 커서 계산(diff 폴백)·압축처럼 전량이 필요한 곳 전용.
+
+        읽기 API 는 이걸 쓰지 않는다 — `_ids_before()` 가 날짜 디렉토리를
+        역순으로 훑어 필요한 만큼만 연다.
+        """
         res = self.git.run(
             "ls-tree", "-r", "--name-only", "-z", ref,
             "--", records.RECORD_DIR + "/", check=False,
@@ -503,6 +563,68 @@ class Channel:
         if res.returncode != 0:
             return []
         return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
+
+    def _list_days(self, ref: str) -> list[str]:
+        """`records/` 바로 아래 날짜 디렉토리 이름 (오름차순). **비재귀**다."""
+        res = self.git.run(
+            "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False
+        )
+        if res.returncode != 0:
+            return []
+        days = []
+        for entry in res.stdout.split("\x00"):
+            if not entry:
+                continue
+            meta, _, path = entry.partition("\t")
+            fields = meta.split()
+            if len(fields) >= 2 and fields[1] == "tree" and path:
+                days.append(path.rsplit("/", 1)[-1])
+        return sorted(days)
+
+    def _list_day(self, ref: str, day: str) -> list[str]:
+        """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순)."""
+        res = self.git.run(
+            "ls-tree", "--name-only", "-z", ref,
+            "--", f"{records.RECORD_DIR}/{day}/", check=False,
+        )
+        if res.returncode != 0:
+            return []
+        return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
+
+    def _ids_before(
+        self, ref: str, before: str | None = None, limit: int | None = None
+    ) -> list[str]:
+        """`before` 보다 **앞선** 레코드 ID 를 최대 `limit` 개 (오름차순).
+
+        ⭐ 역방향 페이징의 심장. 왜 이렇게 하나:
+
+        * 레코드 ID 는 고정폭 타임스탬프로 시작한다 → **사전식 정렬 = 시간순**.
+          그래서 ID 자체가 keyset 커서가 된다. `skip=N` 같은 offset 방식은 쓰지
+          않는다 — 위로 읽는 도중 새 레코드가 도착하면 경계가 밀려 **중복·누락**이
+          생긴다. 커서는 절대 밀리지 않는다.
+        * 날짜 디렉토리를 **역순으로** 훑고, 커서보다 뒤(신)인 날짜는 디렉토리째
+          건너뛴다. 필요한 개수를 채우는 순간 멈춘다 → 방문한 디렉토리 수는
+          `O(요청 건수 / 하루 레코드 수)` 이고, 실제로 여는 blob 은 딱 요청한 만큼이다.
+          (전량 나열 후 잘라내면 대화가 길수록 선형으로 느려진다.)
+        """
+        out: list[str] = []
+        for day in reversed(self._list_days(ref)):
+            prefix = f"{records.RECORD_DIR}/{day}/"
+            if before is not None and prefix > before:
+                continue                      # 이 날짜 전체가 커서보다 뒤다 — 열지 않는다
+            names = self._list_day(ref, day)
+            if before is not None:
+                names = [n for n in names if n < before]
+            if limit is None:
+                out = names + out
+                continue
+            need = limit - len(out)
+            if need <= 0:
+                break
+            out = names[-need:] + out
+            if len(out) >= limit:
+                break
+        return out
 
     def _diff_records(self, base: str, target: str) -> list[str]:
         res = self.git.run(
@@ -627,16 +749,60 @@ class Channel:
             self._advance(cur, target, idx, list(paths[:idx]), mode)
             return True
 
-    def history(self, limit: int | None = None) -> list[records.Record]:
-        """커서와 무관하게 채널의 레코드를 시간순으로 읽는다 (limit 은 최근 N건)."""
+    def history(
+        self, limit: int | None = None, *, before: str | None = None
+    ) -> list[records.Record]:
+        """커서와 무관하게 레코드를 시간순으로 읽는다.
+
+        * `history(limit=N)` — 가장 최근 N건.
+        * `history(before=<record_id>, limit=N)` — 그 ID **직전** N건 (역방향 페이징).
+
+        어느 쪽이든 **요청한 N건의 blob 만** 연다. "더 있는가"까지 알아야 하면
+        `history_page()` 를 쓴다.
+        """
         with self._lock:
             head = self.sync()
             if head is None:
                 return []
-            paths = self._list_records(head)
-            if limit is not None:
-                paths = paths[-limit:]
+            paths = self._ids_before(head, before, limit)
             return [r for r in (self._read_record(p, head) for p in paths) if r]
+
+    def history_page(
+        self, *, before: str | None = None, limit: int = DEFAULT_PAGE
+    ) -> HistoryPage:
+        """⭐ 역방향 페이징 한 쪽 — `HistoryPage(records, has_more)`.
+
+        `before=None` 이면 최신 쪽 한 쪽. 다음 쪽은 `before=page.oldest` 로 잇는다.
+        `has_more` 는 **한 건을 더 나열해 보고**(blob 은 열지 않는다) 판정한다 —
+        소비자가 빈 페이지를 받아보고서야 끝을 아는 일이 없게.
+        """
+        n = max(1, int(limit))
+        with self._lock:
+            head = self.sync()
+            if head is None:
+                return HistoryPage([], False)
+            ids = self._ids_before(head, before, n + 1)
+            has_more = len(ids) > n
+            if has_more:
+                ids = ids[-n:]
+            recs = [r for r in (self._read_record(p, head) for p in ids) if r]
+            return HistoryPage(recs, has_more)
+
+    def record_ids(
+        self, *, before: str | None = None, limit: int | None = None
+    ) -> list[str]:
+        """레코드 **ID 만** 시간순으로 나열한다 (payload blob 을 열지 않는다).
+
+        `_list_records()` 를 공개하는 대신 이 형태로 연다: 소비자가 실제로 원하는
+        것은 "전량 나열"이 아니라 **커서 기준 열거**이고, 전량 나열을 공개하면
+        비싼 경로가 기본이 된다. 인덱스·동기화 상태 확인처럼 payload 가 필요 없는
+        용도를 위한 API 다.
+        """
+        with self._lock:
+            head = self.sync()
+            if head is None:
+                return []
+            return self._ids_before(head, before, limit)
 
     def skip_to_now(self) -> None:
         """지금까지의 레코드를 '이미 처리됨'으로 표시한다 (백로그 건너뛰기)."""

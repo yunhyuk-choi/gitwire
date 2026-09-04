@@ -21,6 +21,11 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
     for rec in ch.fetch_new():
         print(rec.id, rec.payload)
 
+    # 역방향 페이징 (과거로 거슬러 올라가는 소비자 — 무한 스크롤 등)
+    page = ch.history_page(limit=50)
+    while page.has_more:
+        page = ch.history_page(before=page.oldest, limit=50)
+
     # 상시 구독 (루프를 도는 소비자 — 웹앱 등)
     sub = ch.subscribe(lambda rec: print(rec.payload))
 """
@@ -28,8 +33,10 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
 from .channel import (
     DEFAULT_BATCH_WINDOW,
     DEFAULT_BRANCH,
+    DEFAULT_PAGE,
     DEFAULT_POLL_INTERVAL,
     Channel,
+    HistoryPage,
     Subscription,
     open_channel,
 )
@@ -47,10 +54,11 @@ from .errors import (
 )
 from .gitcmd import GitRunner, SubprocessGitRunner
 from .hub import Hub
+from .identity import installation_id
 from .layout import channel_dir, gitwire_home, normalize_repo_url
 from .records import Record
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
@@ -60,6 +68,7 @@ __all__ = [
     "open_channel",
     "Hub",
     "Record",
+    "HistoryPage",
     # 자격증명
     "Credential",
     "NoCredential",
@@ -74,6 +83,8 @@ __all__ = [
     # 커서
     "Cursor",
     "CursorStore",
+    # 설치본 신원 (sender 기본값)
+    "installation_id",
     # 위치 규약
     "gitwire_home",
     "channel_dir",
@@ -90,4 +101,5 @@ __all__ = [
     "DEFAULT_BRANCH",
     "DEFAULT_POLL_INTERVAL",
     "DEFAULT_BATCH_WINDOW",
+    "DEFAULT_PAGE",
 ]

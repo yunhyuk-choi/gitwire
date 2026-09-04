@@ -10,8 +10,9 @@
 
     {"gitwire": 1, "id": "...", "sender": "...", "ts": "...", "payload": {...}}
 
-`sender` 는 "누가 말했나"가 아니라 **어느 참가자 프로세스가 발행했나**라는
-전송 수준 식별자다(IP 주소에 가깝다). 파일명 충돌 회피와 순서 안정화에 쓴다.
+`sender` 는 "누가 말했나"가 아니라 **어느 설치본이 발행했나**라는 전송 수준
+식별자다(IP 주소에 가깝다). 파일명 충돌 회피와 순서 안정화, 그리고 "이 레코드가
+내가 낸 것인가" 판정에 쓴다. 기본값을 만드는 규칙은 `identity.py` 에 있다.
 소비자가 표시용 신원을 쓰고 싶다면 payload 안에 자기 스키마로 담는다.
 
 파일 배치
@@ -38,7 +39,14 @@ RECORD_DIR = "records"
 #: 봉투 포맷 버전
 ENVELOPE_VERSION = 1
 
-_SENDER_SAFE = re.compile(r"[^A-Za-z0-9_.]+")
+#: 발신자 슬러그 상한. 설치본 식별자가 `<git 이메일>.<난수6>` 이므로 예전
+#: 상한(24자)으로는 이메일이 잘리며 **난수 접미까지 함께 잘려** 설치본이 구별되지
+#: 않을 수 있다. 파일명 길이는 여전히 넉넉하다(경로 총 100자 안팎).
+MAX_SENDER_LEN = 40
+
+#: 파일명에 허용하는 문자. '@' 와 '+' 는 이메일에 쓰이고 모든 대상 OS 에서
+#: 파일명으로 안전하다. '-' 는 파일명 구분자라 계속 제외한다.
+_SENDER_SAFE = re.compile(r"[^A-Za-z0-9_.@+]+")
 _TS_RE = re.compile(r"^(\d{8}T\d{9}Z)-")
 
 
@@ -46,7 +54,7 @@ class RecordDecodeError(ValueError):
     """레코드 파일을 봉투로 해석할 수 없다."""
 
 
-def slug_sender(sender: str, max_len: int = 24) -> str:
+def slug_sender(sender: str, max_len: int = MAX_SENDER_LEN) -> str:
     """발신자 식별자를 파일명에 안전한 형태로 만든다.
 
     '-' 는 파일명 구분자라 제거한다. 빈 값이면 'anon'.
