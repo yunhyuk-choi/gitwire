@@ -221,7 +221,24 @@ class Channel:
         self.consumer = self.cursors.consumer
 
         self._runner = runner or SubprocessGitRunner()
+        # ⭐ 락이 둘이다. **순서는 언제나 `_remote` → `_lock`** 이며 그 반대는 없다.
+        #
+        # `_lock`   : 작업 사본·인덱스·`_pending`·커서·캐시를 만지는 **짧은 로컬**
+        #             구간. `append()` 와 모든 읽기 API 가 이것만 쓴다 →
+        #             네트워크 때문에 막히는 일이 없어야 한다.
+        # `_remote` : "원격 상태 전이"(커밋 → push → fetch → 통합) 전체를
+        #             직렬화한다. **네트워크를 여기서 기다린다.** 두 스레드가
+        #             동시에 push 하거나, push 중에 남이 rebase 해서 우리가 방금
+        #             올린 커밋을 로컬에서 갈아치우는 일을 막는다.
+        #
+        # 재진입 가능(RLock)이라 `compact()` 처럼 안에서 `flush()`·`sync()` 를
+        # 다시 부르는 경로가 그대로 성립한다.
+        #
+        # ⚠️ `open()`/`_ensure_layout()` 은 `_remote` 를 **잡지 않는다**. 그것들은
+        # `_lock` 안에서 불릴 수 있으므로(`append()` 등) 잡는 순간 순서가 뒤집혀
+        # 교착이 생긴다. 부트스트랩은 `_opened` + `_lock` 으로만 보호한다.
         self._lock = threading.RLock()
+        self._remote = threading.RLock()
         self._pending: list[str] = []
         self._pending_since: float | None = None
         self._flush_cv = threading.Condition(self._lock)
@@ -510,9 +527,9 @@ class Channel:
         self._pending.clear()
         self._pending_since = None
 
-    def _mark_pushed(self) -> None:
-        """현재 HEAD 까지가 원격에 반영됐음을 로컬 ref 로 남긴다."""
-        self.git.run("update-ref", PUSHED_REF, "HEAD", check=False)
+    def _mark_pushed(self, sha: str | None = None) -> None:
+        """여기까지가 원격에 반영됐음을 로컬 ref 로 남긴다 (기본 현재 HEAD)."""
+        self.git.run("update-ref", PUSHED_REF, sha or "HEAD", check=False)
 
     def _unpushed_count(self) -> int:
         """아직 원격에 올리지 않은 커밋 수. shallow 에서도 성립한다."""
@@ -592,16 +609,19 @@ class Channel:
         그래서 락은 **로컬을 바꾸는 동안만** 쥔다:
 
         * `has_changes()`(= ls-remote)는 로컬 상태를 건드리지 않는다 → 락 밖.
-        * `_fetch()` + `_integrate()` 는 작업 사본·ref 를 바꾼다 → 락 안.
-          그 사이에 다른 스레드가 이미 당겼을 수 있으므로 **락 안에서 한 번 더
-          판정**한다(이중 검사). 헛돌아도 정확성에는 영향이 없다.
+        * `_fetch()` 는 오브젝트와 원격추적 ref 만 쓴다(작업 사본·인덱스를 만지지
+          않는다) → **채널 락 밖**. 대신 `_remote` 로 다른 원격 전이와만 직렬화한다.
+        * `_integrate()` 는 작업 사본·브랜치를 바꾼다 → 채널 락 안.
+          그 사이에 다른 스레드가 이미 당겼을 수 있으므로 **한 번 더 판정**한다
+          (이중 검사). 헛돌아도 정확성에는 영향이 없다.
         """
         self.open()
         if self.has_changes():
-            with self._lock:
+            with self._remote:              # 원격 상태 전이는 하나씩
                 if self.has_changes():      # 다른 스레드가 먼저 당겼을 수 있다
-                    self._fetch()
-                    self._integrate()
+                    self._fetch()           # 네트워크 — 락 밖
+                    with self._lock:
+                        self._integrate()   # 로컬 변경 — 락 안
         with self._lock:
             return self._head()
 
@@ -615,10 +635,11 @@ class Channel:
 
         네트워크(fetch)는 **락 밖**, 로컬을 바꾸는 통합만 락 안이다.
         """
-        self._fetch(quiet=True)
-        with self._lock:
-            self._integrate()
-            return self._remote_ref()
+        with self._remote:
+            self._fetch(quiet=True)
+            with self._lock:
+                self._integrate()
+                return self._remote_ref()
 
     def local_head(self) -> str | None:
         """원격을 **보지 않고** 로컬 클론의 HEAD 만 돌려준다 (원격 왕복 0회).
@@ -659,15 +680,16 @@ class Channel:
 
     def recover(self, discard_local: bool = False) -> None:
         """히스토리 재작성 후 복구. discard_local=True 면 미푸시 커밋을 버린다."""
-        with self._lock:
-            self.open()
-            self._fetch()
-            remote = self._remote_ref()
-            if remote and discard_local:
-                self.git.run("reset", "--hard", remote)
-                self._mark_pushed()
-            else:
-                self._integrate()
+        self.open()
+        with self._remote:
+            self._fetch()                   # 네트워크 — 채널 락 밖
+            with self._lock:
+                remote = self._remote_ref()
+                if remote and discard_local:
+                    self.git.run("reset", "--hard", remote)
+                    self._mark_pushed()
+                else:
+                    self._integrate()
 
     # --------------------------------------------------------------- append
 
@@ -744,38 +766,74 @@ class Channel:
                 time.sleep(min(self.batch_window, 5.0))
 
     def flush(self, push_attempts: int = DEFAULT_PUSH_ATTEMPTS) -> int:
-        """대기 중인 레코드를 **한 커밋**으로 묶어 커밋·push 한다. 커밋된 건수."""
-        with self._lock:
-            self.open()
-            count = len(self._pending)
-            self._absorb_worktree()
-            if self._unpushed_count() == 0:
+        """대기 중인 레코드를 **한 커밋**으로 묶어 커밋·push 한다. 커밋된 건수.
+
+        ⭐ **push(네트워크)를 채널 락 안에서 하지 않는다.**
+
+        실측(윈도우 · push 2.7초를 흉내낸 원격 · 6건 연속 전송): 예전에는
+        `flush()` 가 push 가 끝날 때까지 `_lock` 을 쥐고 있었고, 그 락은
+        `append()` 와 모든 읽기가 함께 쓴다. 그래서 **첫 건만 42ms 였고 2번째부터
+        3.3초**였다 — 사용자가 친 다음 메시지가 배경 push 뒤에 줄을 섰다.
+        (같은 실수를 `sync()` 에서 한 번 고쳤는데 `flush()` 만 그 규율 밖에
+        남아 있었다.)
+
+        지금은 커밋까지만 `_lock` 안에서 하고, push 는 `_remote` 만 쥔 채
+        **락 밖**에서 기다린다. 같은 조건에서 전송 응답 중앙값이 3365ms → 49ms 가
+        되고, push 중 조회는 3484ms → 46ms 가 된다 (README 「push 도 락 밖으로」).
+
+        push 중에 들어오는 `append()` 는 작업 사본에 **새 파일을 쓸 뿐**
+        인덱스·HEAD 를 건드리지 않는다. 그 레코드는 다음 flush 가 가져간다.
+        읽기는 커밋 기준이라 영향이 없다. 위험한 것은 *다른 원격 전이*(sync 의
+        통합·롤업·compact)가 push 도중 끼어들어 우리가 방금 올린 커밋을 로컬에서
+        갈아치우는 경우인데, 그것들이 전부 `_remote` 를 거치므로 겹치지 않는다.
+        """
+        self.open()                          # ⚠️ 락을 잡기 **전에** (교착 방지)
+        with self._remote:
+            with self._lock:
+                count = len(self._pending)
+                self._absorb_worktree()      # 커밋 — 로컬 변경이라 락이 필요하다
+                if self._unpushed_count() == 0:
+                    return 0
+                head = self._head()
+            if head is None:
                 return 0
-            self._push_with_retry(push_attempts)
+            self._push_with_retry(head, push_attempts)
             return count
 
-    def _push(self) -> None:
-        self.git.run("push", "origin", f"HEAD:refs/heads/{self.branch}")
+    def _push(self, sha: str | None = None) -> None:
+        """`sha`(기본 HEAD)를 원격 브랜치로 밀어낸다.
 
-    def _push_with_retry(self, attempts: int) -> None:
-        """push 거부(선점) 시 fetch + rebase 후 재시도.
+        ⭐ **명시적인 sha 를 민다.** 락 밖에서 push 하므로 `HEAD:` 로 밀면 "무엇을
+        올렸는지"가 push 시점에야 정해지고, 뒤이어 `_mark_pushed()` 가 *그 사이
+        늘어난* 커밋까지 "올렸다"고 표시해 **아직 안 올라간 레코드를 올라간 것으로
+        착각**할 수 있다.
+        """
+        self.git.run("push", "origin", f"{sha or 'HEAD'}:refs/heads/{self.branch}")
+
+    def _push_with_retry(self, head: str, attempts: int) -> None:
+        """push 거부(선점) 시 fetch + rebase 후 재시도. **`_remote` 를 쥔 채 부른다.**
 
         레코드가 서로 다른 파일이므로 rebase 는 내용 충돌 없이 항상 성공한다.
+        네트워크(push·fetch)는 채널 락 밖에서, 로컬 변경(통합·ref 기록)만 락 안에서.
         """
         delay = 0.05
         last = max(1, attempts) - 1
         for i in range(max(1, attempts)):
             try:
-                self._push()
-                self._mark_pushed()
-                return
+                self._push(head)             # 네트워크 — 채널 락 밖
             except PushRejected:
                 if i == last:
                     raise
-                self._fetch()
-                self._integrate()
+                self._fetch()                # 네트워크 — 채널 락 밖
+                with self._lock:
+                    self._integrate()        # 로컬 변경 — 락 안
+                    head = self._head() or head   # rebase 로 sha 가 바뀐다
                 time.sleep(delay)
                 delay = min(delay * 2, 2.0)
+                continue
+            with self._lock:
+                self._mark_pushed(head)      # 방금 **실제로** 올린 sha 를 기록
+            return
 
     # ----------------------------------------------------------------- 읽기
 
@@ -1560,16 +1618,19 @@ class Channel:
                     "days": [], "skipped": skipped, "attempts": attempt,
                 }
             commit = self._rollup_commit(base, plan)
-            try:
-                self.git.run("push", "origin", f"{commit}:refs/heads/{self.branch}")
-            except PushRejected:
-                log.info(
-                    "gitwire: 롤업 push 경합 (%d/%d) — 새 원격 상태에서 다시 계산한다",
-                    attempt, tries,
-                )
-                continue
-            # 원격이 확정됐다. 로컬을 따라오게 한다 (fetch 는 락 밖, 통합만 락 안).
-            self._pull()
+            # push 와 뒤이은 로컬 통합은 하나의 원격 전이다 → `_remote` 안에서
+            # (채널 락은 여전히 잡지 않는다 — 발행·읽기가 계속 흐른다).
+            with self._remote:
+                try:
+                    self.git.run("push", "origin", f"{commit}:refs/heads/{self.branch}")
+                except PushRejected:
+                    log.info(
+                        "gitwire: 롤업 push 경합 (%d/%d) — 새 원격 상태에서 다시 계산한다",
+                        attempt, tries,
+                    )
+                    continue
+                # 원격이 확정됐다. 로컬을 따라오게 한다 (통합만 채널 락 안).
+                self._pull()
             return {
                 "rolled": True, "commit": commit, "base": base,
                 "days": [d for d, _, _ in plan],
@@ -1657,8 +1718,10 @@ class Channel:
         """
         if not confirm:
             raise ValueError("compact() 는 파괴적이다. confirm=True 를 명시하라.")
-        with self._lock:
-            self.open()
+        self.open()                          # ⚠️ 락을 잡기 **전에** (교착 방지)
+        # 히스토리 재작성은 가장 큰 원격 전이다 → `_remote` 를 먼저(순서 규약),
+        # 그 안에서 채널 락. 안쪽의 flush()·sync() 는 RLock 이라 재진입한다.
+        with self._remote, self._lock:
             self.flush()
             head = self.sync()
             if head is None:

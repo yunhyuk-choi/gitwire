@@ -399,18 +399,24 @@ def test_rollup_does_not_block_reads_and_writes(participant, capsys):
     writes: list[float] = []
     done: dict = {}
 
-    def hammer(store, fn):
+    def hammer(store, fn, gap=0.0):
         while not stop.is_set():
             t0 = time.perf_counter()
             fn()
             store.append((time.perf_counter() - t0) * 1000)
+            if gap:
+                time.sleep(gap)
 
     threads = [
         threading.Thread(
             target=hammer, args=(reads, lambda: reader.history_page(limit=20, fresh=False))
         ),
+        # ⚠️ 쓰기에는 간격을 준다. 간격 없이 때리면 미커밋 레코드가 `max_batch`(200)를
+        # 넘겨 `append()` 자신이 flush·push 를 트리거하고, 그 push 가 롤업 push 와
+        # 경합해 이번 롤업이 양보한다(유실은 없지만 이 테스트의 관심사가 아니다).
         threading.Thread(
-            target=hammer, args=(writes, lambda: a.append({"n": "during"}, flush=False))
+            target=hammer,
+            args=(writes, lambda: a.append({"n": "during"}, flush=False), 0.02),
         ),
     ]
     for t in threads:
