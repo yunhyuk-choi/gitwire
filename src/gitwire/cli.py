@@ -252,6 +252,19 @@ def cmd_compact(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_rollup(args: argparse.Namespace) -> int:
+    """지난 날짜 롤업 (비파괴). `compact` 와 다른 물건이다 — force-push 없음."""
+    with _channel(args) as ch:
+        result = ch.rollup(
+            grace_hours=args.grace_hours,
+            min_records=args.min_records,
+            days=args.day or None,
+            force=args.force,
+        )
+        _emit({"ok": True, "command": "rollup", **result})
+    return EXIT_OK
+
+
 def cmd_where(args: argparse.Namespace) -> int:
     """클론 위치만 알려준다 (네트워크 접근 없음)."""
     from . import layout
@@ -357,6 +370,29 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--keep", type=int, default=None, help="최근 레코드 N건만 보존")
     sp.add_argument("--yes", action="store_true", help="파괴적 동작을 명시 승인")
     sp.set_defaults(func=cmd_compact)
+
+    sp = sub.add_parser(
+        "rollup",
+        help="지난 날짜의 레코드를 하루 1파일로 접는다 (비파괴 — compact 와 다르다)",
+    )
+    common(sp)
+    sp.add_argument(
+        "--grace-hours", type=float, default=None,
+        help="UTC 자정 이후 이만큼 지나야 '지난 날'로 본다 (기본 2)",
+    )
+    sp.add_argument(
+        "--min-records", type=int, default=None,
+        help="이 미만이면 접지 않는다 (기본 2)",
+    )
+    sp.add_argument(
+        "--day", action="append", default=None,
+        help="이 날짜만 접는다 (YYYYMMDD, 반복 가능)",
+    )
+    sp.add_argument(
+        "--force", action="store_true",
+        help="'지난 날' 판정을 무시하고 접는다 (--day 와 함께 쓴다)",
+    )
+    sp.set_defaults(func=cmd_rollup)
 
     sp = sub.add_parser("where", help="로컬 클론·커서 경로 출력 (네트워크 없음)")
     sp.add_argument("--repo", required=True)
