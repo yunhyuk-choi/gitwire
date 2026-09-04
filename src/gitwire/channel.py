@@ -549,12 +549,30 @@ class Channel:
         )
 
     def sync(self) -> str | None:
-        """변경이 있을 때만 fetch/통합한다. 반환값은 로컬 HEAD SHA."""
+        """변경이 있을 때만 fetch/통합한다. 반환값은 로컬 HEAD SHA.
+
+        ⭐ **네트워크 왕복은 락 밖에서 한다.**
+
+        `ls-remote` 는 실측 1.3초다(자격증명 헬퍼 + HTTPS 왕복 3회 + 프로세스
+        기동). 예전에는 그 1.3초 내내 `_lock` 을 쥐고 있었고, 채널 락은 읽기
+        경로도 함께 쓰므로 **폴러가 도는 동안 로컬 읽기가 통째로 막혔다.**
+        읽기에서 원격을 뗀 뒤에도 조회가 1.5초씩 걸린 진짜 이유가 이것이었다 —
+        조회 자체는 40ms 인데 폴러 뒤에 줄을 서 있었다.
+
+        그래서 락은 **로컬을 바꾸는 동안만** 쥔다:
+
+        * `has_changes()`(= ls-remote)는 로컬 상태를 건드리지 않는다 → 락 밖.
+        * `_fetch()` + `_integrate()` 는 작업 사본·ref 를 바꾼다 → 락 안.
+          그 사이에 다른 스레드가 이미 당겼을 수 있으므로 **락 안에서 한 번 더
+          판정**한다(이중 검사). 헛돌아도 정확성에는 영향이 없다.
+        """
+        self.open()
+        if self.has_changes():
+            with self._lock:
+                if self.has_changes():      # 다른 스레드가 먼저 당겼을 수 있다
+                    self._fetch()
+                    self._integrate()
         with self._lock:
-            self.open()
-            if self.has_changes():
-                self._fetch()
-                self._integrate()
             return self._head()
 
     def local_head(self) -> str | None:
@@ -912,8 +930,8 @@ class Channel:
 
     def peek_new(self, limit: int | None = None) -> list[records.Record]:
         """커서를 **전진시키지 않고** 새 레코드를 본다 (직접 ack 하려는 소비자용)."""
+        head = self.sync()                     # 네트워크는 락 밖에서
         with self._lock:
-            head = self.sync()
             target, paths, _ = self._plan(self.cursors.load(), head)
             if limit is not None:
                 paths = paths[:limit]
@@ -927,8 +945,8 @@ class Channel:
         한 번의 호출로 리스트를 반환하고, 마지막 처리 지점을 **디스크에** 남긴다.
         매번 새 프로세스로 실행해도 중복·유실이 없다.
         """
+        head = self.sync()                     # 네트워크는 락 밖에서
         with self._lock:
-            head = self.sync()
             cur = self.cursors.load()
             target, paths, mode = self._plan(cur, head)
             take = paths if limit is None else paths[:limit]
@@ -966,8 +984,8 @@ class Channel:
         `fresh=False` 면 원격을 보지 않고 로컬 클론만 읽는다 (`_read_head()` 의
         「신선도 정책」).
         """
+        head = self._read_head(fresh)          # 원격 왕복이 있다면 락 밖에서
         with self._lock:
-            head = self._read_head(fresh)
             if head is None:
                 return []
             paths = self._ids_before(head, before, limit)
@@ -991,8 +1009,8 @@ class Channel:
         기준 커밋이 무엇이든 성립한다.
         """
         n = max(1, int(limit))
+        head = self._read_head(fresh)          # 원격 왕복이 있다면 락 밖에서
         with self._lock:
-            head = self._read_head(fresh)
             if head is None:
                 return HistoryPage([], False)
             ids = self._ids_before(head, before, n + 1)
@@ -1019,16 +1037,16 @@ class Channel:
         `fresh=False` 면 원격을 보지 않고 로컬 클론만 읽는다 (`_read_head()` 의
         「신선도 정책」).
         """
+        head = self._read_head(fresh)          # 원격 왕복이 있다면 락 밖에서
         with self._lock:
-            head = self._read_head(fresh)
             if head is None:
                 return []
             return self._ids_before(head, before, limit)
 
     def skip_to_now(self) -> None:
         """지금까지의 레코드를 '이미 처리됨'으로 표시한다 (백로그 건너뛰기)."""
+        head = self.sync()                     # 네트워크는 락 밖에서
         with self._lock:
-            head = self.sync()
             cur = self.cursors.load()
             paths = self._list_records(head) if head else []
             cur.commit = head
@@ -1054,8 +1072,8 @@ class Channel:
         프로세스가 죽어도 다음 실행이 정확히 이어진다.
         """
         delivered = 0
-        with self._lock:
-            head = self.sync()
+        head = self.sync()                     # 네트워크는 락 밖에서 —
+        with self._lock:                       # 폴링이 읽기를 막지 않는다
             cur = self.cursors.load()
             target, paths, mode = self._plan(cur, head)
             if target is None:

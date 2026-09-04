@@ -7,13 +7,17 @@
 * **L-2** 계약이 그대로다 — 같은 레코드, 같은 페이지 경계, 중복·누락 없음.
 * **L-3** 바뀌는 의미는 **딱 하나**다: 남이 방금 push 한 것은 안 보인다.
   그리고 그 신선도는 **구독(폴러)** 이 가져온다 — 읽기가 아니라.
-* **L-4** `credential_helpers=` 는 **이 클론의 local 설정에만** 쓰고, 상속된
+* **L-4** 폴러가 원격을 기다리는 동안 **로컬 읽기가 막히지 않는다.**
+  (락을 좁히기 전에는 읽기를 로컬로 바꾼 뒤에도 조회가 1.5초씩 걸렸다 —
+  조회 자체는 40ms 인데 `sync()` 뒤에 줄을 서 있었다.)
+* **L-5** `credential_helpers=` 는 **이 클론의 local 설정에만** 쓰고, 상속된
   helper 를 사슬 뒤에 남기며, 사용자의 global 을 고치지 않는다.
 """
 
 from __future__ import annotations
 
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -179,7 +183,59 @@ def test_local_read_is_stale_until_the_poller_runs(bare_repo, homes):
         writer.close()
 
 
-# --------------------------------------------- L-4. 자격증명 helper 사슬
+# ------------------------------- L-4. 폴링이 로컬 읽기를 막지 않는다
+
+
+class SlowRemoteRunner(SubprocessGitRunner):
+    """`ls-remote` 를 붙잡아 두는 러너 — 느린 원격을 결정론적으로 흉내 낸다."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def run(self, args, **kwargs):
+        if "ls-remote" in args:
+            self.entered.set()
+            self.release.wait(10.0)
+        return super().run(args, **kwargs)
+
+
+def test_폴링이_원격을_기다리는_동안에도_로컬_읽기가_돈다(bare_repo, homes):
+    """⭐ 읽기에서 원격을 뗀 것만으로는 부족하다 — **락도** 떼야 한다.
+
+    `sync()` 가 `ls-remote`(실측 1.3초) 내내 채널 락을 쥐고 있으면, 읽기 경로가
+    같은 락을 쓰므로 조회가 그 뒤에 줄을 선다. 실제로 그랬다: 읽기를 로컬로
+    바꾼 뒤에도 소비자 앱의 조회가 1.5초였다.
+    """
+    writer = _open(bare_repo, homes("w"), "alice")
+    _fill(writer, 6)
+    runner = SlowRemoteRunner()
+    reader = _open(bare_repo, homes("r"), "bob", runner)
+    try:
+        poller = threading.Thread(target=reader.sync, daemon=True)
+        poller.start()
+        assert runner.entered.wait(10.0), "ls-remote 에 진입하지 못했다"
+
+        # 폴러가 원격을 붙잡고 있는 **바로 그 순간** 로컬 읽기를 시도한다.
+        done = threading.Event()
+        result = {}
+
+        def read():
+            result["page"] = reader.history_page(limit=3, fresh=False)
+            done.set()
+
+        threading.Thread(target=read, daemon=True).start()
+        assert done.wait(5.0), "폴러가 원격을 기다리는 동안 로컬 읽기가 막혔다"
+        assert len(result["page"].records) == 3
+    finally:
+        runner.release.set()
+        poller.join(timeout=10.0)
+        reader.close()
+        writer.close()
+
+
+# --------------------------------------------- L-5. 자격증명 helper 사슬
 
 
 def _local_helpers(clone: Path) -> list[str]:
