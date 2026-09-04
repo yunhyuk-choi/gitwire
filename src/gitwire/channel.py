@@ -24,6 +24,7 @@ from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
 from .errors import ChannelInitError, GitError, HistoryRewritten, PushRejected
 from .gitcmd import Git, GitRunner, SubprocessGitRunner
+from .treecache import TreeCache
 
 log = logging.getLogger("gitwire")
 
@@ -173,6 +174,9 @@ class Channel:
         self._closing = threading.Event()
         self._opened = False
         self._attempts: dict[str, int] = {}
+        # 나열 결과 캐시. 키가 sha(내용 주소)라 stale 이 정의상 불가능하다 —
+        # 근거와 크기 제한은 treecache.py 참조.
+        self._trees = TreeCache()
 
         if clock is not None:
             self.clock = clock
@@ -564,32 +568,63 @@ class Channel:
             return []
         return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
 
-    def _list_days(self, ref: str) -> list[str]:
-        """`records/` 바로 아래 날짜 디렉토리 이름 (오름차순). **비재귀**다."""
-        res = self.git.run(
-            "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False
-        )
-        if res.returncode != 0:
-            return []
-        days = []
-        for entry in res.stdout.split("\x00"):
-            if not entry:
-                continue
-            meta, _, path = entry.partition("\t")
-            fields = meta.split()
-            if len(fields) >= 2 and fields[1] == "tree" and path:
-                days.append(path.rsplit("/", 1)[-1])
-        return sorted(days)
+    def _day_trees(self, ref: str) -> list[tuple[str, str]]:
+        """`records/` 바로 아래 (날짜, 트리 sha) 목록. 오름차순, **비재귀** 1회 호출.
 
-    def _list_day(self, ref: str, day: str) -> list[str]:
-        """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순)."""
-        res = self.git.run(
-            "ls-tree", "--name-only", "-z", ref,
-            "--", f"{records.RECORD_DIR}/{day}/", check=False,
-        )
-        if res.returncode != 0:
-            return []
-        return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
+        날짜 이름과 그 디렉토리의 트리 sha 가 **한 번의 호출로 같이 나온다** —
+        sha 를 따로 물어보는 왕복이 없다는 것이 이 형태를 고른 이유다.
+        결과는 커밋 sha 로 캐시한다(같은 커밋 = 같은 트리 = 같은 목록).
+        """
+        key = "days:" + ref
+        cached = self._trees.get(key)
+        if cached is None:
+            res = self.git.run(
+                "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False
+            )
+            rows = []
+            if res.returncode == 0:
+                for entry in res.stdout.split("\x00"):
+                    if not entry:
+                        continue
+                    meta, _, path = entry.partition("\t")
+                    fields = meta.split()
+                    if len(fields) >= 3 and fields[1] == "tree" and path:
+                        # "<트리 sha> <날짜>" 로 한 줄에 담는다 (캐시 값은 문자열 목록).
+                        rows.append(f"{fields[2]} {path.rsplit('/', 1)[-1]}")
+            cached = self._trees.put(key, sorted(rows, key=lambda r: r.split(" ", 1)[1]))
+        out = []
+        for row in cached:
+            sha, _, day = row.partition(" ")
+            out.append((day, sha))
+        return out
+
+    def _day_records(self, day: str, tree: str) -> list[str]:
+        """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순).
+
+        **트리 sha 로 직접 나열하고 그 sha 로 캐시한다.** 커밋이 아니라 트리를
+        키로 쓰는 것이 더 촘촘하다 — 새 레코드가 오늘 날짜에 추가돼도 어제
+        날짜의 트리 sha 는 그대로라 캐시가 계속 맞는다. 반대로 그 날짜에 무엇이든
+        추가되면 sha 가 달라지므로 **낡은 목록이 나올 수 없다**(무효화 불필요).
+
+        캐시에는 파일명만 담고 `records/<날짜>/` 접두는 쓸 때 붙인다 — 값이
+        접두와 무관하므로 키(sha)와 값이 어긋날 여지가 아예 없다.
+        """
+        key = "tree:" + tree
+        names = self._trees.get(key)
+        if names is None:
+            res = self.git.run("ls-tree", "--name-only", "-z", tree, check=False)
+            found = (
+                sorted(n for n in res.stdout.split("\x00") if n.endswith(".json"))
+                if res.returncode == 0
+                else []
+            )
+            names = self._trees.put(key, found)
+        prefix = f"{records.RECORD_DIR}/{day}/"
+        return [prefix + n for n in names]
+
+    def cache_info(self) -> dict:
+        """나열 캐시 상태 (관측용). 키가 sha 라 무효화 항목은 없다."""
+        return self._trees.info()
 
     def _ids_before(
         self, ref: str, before: str | None = None, limit: int | None = None
@@ -606,13 +641,15 @@ class Channel:
           건너뛴다. 필요한 개수를 채우는 순간 멈춘다 → 방문한 디렉토리 수는
           `O(요청 건수 / 하루 레코드 수)` 이고, 실제로 여는 blob 은 딱 요청한 만큼이다.
           (전량 나열 후 잘라내면 대화가 길수록 선형으로 느려진다.)
+        * 나열 결과는 **sha 로 캐시**되므로, 무한 스크롤처럼 같은 상태를 반복
+          조회하는 경로에서는 git 호출이 0회가 된다 (treecache.py).
         """
         out: list[str] = []
-        for day in reversed(self._list_days(ref)):
+        for day, tree in reversed(self._day_trees(ref)):
             prefix = f"{records.RECORD_DIR}/{day}/"
             if before is not None and prefix > before:
                 continue                      # 이 날짜 전체가 커서보다 뒤다 — 열지 않는다
-            names = self._list_day(ref, day)
+            names = self._day_records(day, tree)
             if before is not None:
                 names = [n for n in names if n < before]
             if limit is None:

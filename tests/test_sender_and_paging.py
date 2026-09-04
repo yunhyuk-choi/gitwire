@@ -21,6 +21,7 @@ import gitwire
 from gitwire import records
 from gitwire.channel import Channel
 from gitwire.clock import FixedOffsetClock
+from gitwire.gitcmd import SubprocessGitRunner
 
 
 class StepClock:
@@ -135,6 +136,14 @@ def test_append_record_matches_what_others_read(participant):
 # --------------------------------------------- C-1. 역방향 페이징
 
 
+def participant_channel(bare_repo, home, sender="alice"):
+    """픽스처를 거치지 않고 채널 하나를 연다 (runner 를 갈아끼울 때 쓴다)."""
+    return gitwire.Channel(
+        str(bare_repo), home=home, sender=sender,
+        clock=FixedOffsetClock(0.0), batch_window=0.0,
+    ).open()
+
+
 def _fill(channel, count, start=None, step=None):
     clock = StepClock(
         start or datetime(2026, 9, 1, 0, 0, 0, tzinfo=timezone.utc),
@@ -226,13 +235,13 @@ def test_paging_skips_day_directories_it_does_not_need(participant, monkeypatch)
     assert len(days) == 4, f"날짜 디렉토리가 4개여야 한다: {days}"
 
     visited: list[str] = []
-    original = Channel._list_day
+    original = Channel._day_records
 
-    def spy(self, ref, day):
+    def spy(self, day, tree):
         visited.append(day)
-        return original(self, ref, day)
+        return original(self, day, tree)
 
-    monkeypatch.setattr(Channel, "_list_day", spy)
+    monkeypatch.setattr(Channel, "_day_records", spy)
 
     b.history_page(limit=3)
     # 최신 날짜부터 필요한 만큼만 — 하루 3건이므로 "3건 + 더 있나 1건"에
@@ -282,3 +291,164 @@ def test_history_with_before_is_ascending_and_excludes_cursor(participant):
 
     with pytest.raises(TypeError):
         b.history(made[3].id, 3)     # 커서는 반드시 키워드 인자다
+
+
+# ------------------------------------------ C-1(F). 나열 캐시 — stale 불가능
+
+
+class CountingRunner(SubprocessGitRunner):
+    """git 호출을 종류별로 센다 (BASE_CONFIG 의 -c 쌍은 건너뛴다)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    def run(self, args, **kwargs):
+        rest, skip = [], False
+        for a in args:
+            if skip:
+                skip = False
+            elif a == "-c":
+                skip = True
+            elif not a.startswith("-"):
+                rest.append(a)
+        self.calls.append(rest[0] if rest else "?")
+        return super().run(args, **kwargs)
+
+    def count(self, name: str) -> int:
+        return sum(1 for c in self.calls if c == name)
+
+
+def test_second_page_costs_no_listing_calls(bare_repo, homes):
+    """⭐ F 의 요점 — 같은 상태를 다시 나열할 때 git 을 부르지 않는다.
+
+    (실측 근거: git subprocess 는 하는 일과 무관하게 이 머신에서 42~48ms 다.
+    나열을 0회로 만드는 것이 유일하게 그 바닥을 없애는 방법이다.)
+    """
+    writer = participant_channel(bare_repo, homes("w"))
+    _fill(writer, 12)                              # 같은 날짜 12건
+    runner = CountingRunner()
+    reader = gitwire.Channel(
+        str(bare_repo), home=homes("r"), sender="reader",
+        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+    ).open()
+    try:
+        first = reader.history_page(limit=3)
+        after_first = runner.count("ls-tree")
+        assert after_first == 2, "첫 쪽은 날짜 목록 + 그 날짜 나열, 2회면 된다"
+
+        second = reader.history_page(before=first.oldest, limit=3)
+        third = reader.history_page(before=second.oldest, limit=3)
+
+        assert runner.count("ls-tree") == after_first, "캐시가 안 먹었다 (나열이 또 나갔다)"
+        assert [r.payload["i"] for r in first.records] == [9, 10, 11]
+        assert [r.payload["i"] for r in second.records] == [6, 7, 8]
+        assert [r.payload["i"] for r in third.records] == [3, 4, 5]
+        info = reader.cache_info()
+        assert info["hits"] > 0 and info["evictions"] == 0
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_new_day_directory_costs_one_call_then_is_cached(bare_repo, homes):
+    """날짜가 여러 개면 **처음 보는 날짜에만** 나열이 한 번 나간다."""
+    writer = participant_channel(bare_repo, homes("w"))
+    _fill(writer, 12, step=timedelta(hours=8))     # 하루 3건 x 4일
+    runner = CountingRunner()
+    reader = gitwire.Channel(
+        str(bare_repo), home=homes("r"), sender="reader",
+        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+    ).open()
+    try:
+        page = reader.history_page(limit=3)
+        cursors = []
+        while page.has_more:
+            cursors.append(page.oldest)
+            page = reader.history_page(before=page.oldest, limit=3)
+        # 날짜 목록 1회 + 날짜 4개 = 최대 5회.
+        assert runner.count("ls-tree") <= 5, runner.calls
+        walked = runner.count("ls-tree")
+        for cursor in cursors:                      # 같은 자리를 다시 훑는다
+            reader.history_page(before=cursor, limit=3)
+        assert runner.count("ls-tree") == walked, "이미 본 상태를 또 나열했다"
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_cache_cannot_go_stale_when_new_records_arrive(bare_repo, homes):
+    """⭐ sha 키의 요점 — 남이 push 한 것이 캐시 때문에 안 보이는 일이 없다."""
+    writer = participant_channel(bare_repo, homes("w"))
+    _fill(writer, 6)
+    runner = CountingRunner()
+    reader = gitwire.Channel(
+        str(bare_repo), home=homes("r"), sender="reader",
+        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+    ).open()
+    try:
+        assert [r.payload["i"] for r in reader.history()] == [0, 1, 2, 3, 4, 5]
+        assert reader.cache_info()["entries"] > 0      # 캐시가 찼다
+
+        writer.append({"i": 6}, flush=True)            # 커밋 sha 가 바뀐다
+        assert [r.payload["i"] for r in reader.history()] == [0, 1, 2, 3, 4, 5, 6]
+
+        page = reader.history_page(limit=2)
+        assert [r.payload["i"] for r in page.records] == [5, 6]
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_cache_cannot_go_stale_when_a_past_day_grows(bare_repo, homes):
+    """⭐ "지난 날짜는 안 바뀐다"는 가정을 쓰지 않았음을 못 박는다.
+
+    오프라인에서 쓰고 나중에 push 하거나 시계가 어긋난 참가자는 **과거 날짜에**
+    레코드를 추가한다. 규칙 기반 무효화였다면 여기서 조용히 틀린다.
+    """
+    writer = participant_channel(bare_repo, homes("w"))
+    _fill(writer, 6, step=timedelta(hours=8))          # 9/1 3건, 9/2 3건
+    reader = participant_channel(bare_repo, homes("r"), sender="reader")
+    try:
+        before_ids = reader.record_ids()
+        days = sorted({i.split("/")[1] for i in before_ids})
+        assert len(days) == 2
+        assert reader.cache_info()["entries"] > 0      # 두 날짜 모두 캐시에 있다
+
+        # 뒤늦게 도착한 **첫째 날짜**의 레코드 (오프라인 참가자를 흉내낸다)
+        writer.clock = FrozenClock(
+            datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
+        )
+        late = writer.append({"i": 999}, flush=True)
+        assert late.id.split("/")[1] == days[0], "첫째 날짜에 들어가야 하는 레코드다"
+
+        after = reader.record_ids()
+        assert late.id in after, "과거 날짜에 추가된 레코드가 캐시에 가려졌다"
+        assert after == sorted(after)
+        assert len(after) == len(before_ids) + 1
+
+        # 그 날짜를 페이징해도 보인다 (경계 계산이 새 목록 위에서 돈다).
+        page = reader.history_page(before=days[1] and f"records/{days[1]}/", limit=10)
+        assert late.id in [r.id for r in page.records]
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_cache_budget_evicts_and_stays_correct(bare_repo, homes):
+    """상한을 넘으면 LRU 로 버리되 **정확성은 그대로**다 (git 을 다시 부를 뿐)."""
+    writer = participant_channel(bare_repo, homes("w"))
+    _fill(writer, 9, step=timedelta(hours=8))
+    reader = participant_channel(bare_repo, homes("r"), sender="reader")
+    try:
+        reader._trees.max_items = 1        # 사실상 못 담게 만든다
+        reader._trees.clear()
+        assert [r.payload["i"] for r in reader.history()] == list(range(9))
+        page = reader.history_page(limit=4)
+        assert [r.payload["i"] for r in page.records] == [5, 6, 7, 8]
+        older = reader.history_page(before=page.oldest, limit=4)
+        assert [r.payload["i"] for r in older.records] == [1, 2, 3, 4]
+        assert reader.cache_info()["evictions"] > 0
+    finally:
+        reader.close()
+        writer.close()

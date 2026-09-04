@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from gitwire import clock, credentials, gitcmd, identity, layout, records
+from gitwire.treecache import TreeCache
 from gitwire.cursor import Cursor, CursorStore
 from gitwire.errors import AuthError, GitError, PushRejected
 
@@ -375,3 +376,39 @@ def test_consumer_name_is_sanitized(tmp_path):
     store = CursorStore(tmp_path, "../../evil")
     assert ".." not in store.consumer
     assert store.path.parent == tmp_path / "cursors"
+
+
+# ------------------------------------------------------------- treecache
+
+
+def test_tree_cache_is_keyed_by_content_address():
+    """키가 sha 라 값이 섞이지 않는다 — 무효화 로직이 필요 없는 이유."""
+    cache = TreeCache()
+    cache.put("tree:aaa", ["1.json", "2.json"])
+    cache.put("tree:bbb", ["3.json"])
+    assert cache.get("tree:aaa") == ["1.json", "2.json"]
+    assert cache.get("tree:bbb") == ["3.json"]
+    assert cache.get("tree:ccc") is None          # 모르는 sha 는 미스일 뿐
+    info = cache.info()
+    assert info["hits"] == 2 and info["misses"] == 1 and info["entries"] == 2
+
+
+def test_tree_cache_evicts_least_recently_used_by_item_budget():
+    """상한 단위는 항목 수가 아니라 담긴 경로 수다 (항목 크기가 들쭉날쭉하다)."""
+    cache = TreeCache(max_items=5)
+    cache.put("a", ["1", "2", "3"])
+    cache.put("b", ["4", "5"])
+    assert cache.get("a") is not None             # a 를 최근 사용으로 올린다
+    cache.put("c", ["6", "7"])                    # 5 초과 → 가장 오래된 b 가 나간다
+    assert cache.get("b") is None
+    assert cache.get("a") == ["1", "2", "3"]
+    assert cache.get("c") == ["6", "7"]
+    assert cache.info()["evictions"] == 1
+    assert cache.info()["items"] <= 5
+
+
+def test_tree_cache_can_be_disabled():
+    cache = TreeCache(max_items=0)
+    assert cache.put("a", ["1"]) == ["1"]         # 값은 그대로 돌려준다
+    assert cache.get("a") is None                 # 담지는 않는다
+    assert cache.info()["entries"] == 0
