@@ -48,6 +48,14 @@ PUSHED_REF = "refs/gitwire/pushed"
 #: 기본 페이지 크기 (역방향 페이징)
 DEFAULT_PAGE = 50
 
+#: "빈 레포" 로 쳐 주는 파일들. forge 가 새 레포를 만들 때 넣어 주는 것들이라
+#: 이게 있다고 해서 "쓰고 있는 레포"는 아니다.
+EMPTY_REPO_FILES = frozenset({
+    "README.md", "README", "README.rst", "readme.md",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING",
+    ".gitignore", ".gitattributes",
+})
+
 
 def default_sender(home: Path | str | None = None) -> str:
     """설치본 식별자(= 전송 수준 `sender`). 표시용 신원이 아니다.
@@ -273,15 +281,56 @@ class Channel:
         )
         return res.stdout.strip() or None
 
+    def _repo_contents(self, ref: str) -> list[str]:
+        res = self.git.run("ls-tree", "-r", "--name-only", "-z", ref, check=False)
+        if res.returncode != 0:
+            return []
+        return [p for p in res.stdout.split("\x00") if p]
+
+    def _refuse_if_repo_has_content(self) -> None:
+        """⚠️ **쓰고 있는 레포를 채널로 만들지 않는다.**
+
+        `open()` 은 채널이 아닌 레포를 만나면 규약을 심고 **push 한다.** 그 동작이
+        "주소만 주면 방이 된다"를 성립시키지만, 주소를 잘못 넣으면 *남의(또는 내)
+        코드 레포에 커밋이 올라간다.* 실제로 그렇게 만든 적이 있다 — 인증 실패를
+        시험하려고 진짜 코드 레포 주소를 넣었더니 `gitwire.json` 이 그 레포
+        main 에 push 됐다.
+
+        그래서 규칙을 좁힌다: **빈 레포(또는 README·LICENSE 정도만 있는 새 레포)
+        에만 심는다.** 이미 내용이 있으면 아무것도 쓰지 않고 거부한다.
+        정말 그 레포를 채널로 쓰고 싶으면 `gitwire.json` 을 직접 커밋해 두면 된다
+        (그러면 아래 `CHANNEL_META` 검사에서 이미 채널로 인식된다).
+        """
+        head = self._head()
+        if head is None:
+            return                      # 완전히 빈 레포 — 방으로 만든다
+        extra = [
+            path for path in self._repo_contents(head)
+            if path not in EMPTY_REPO_FILES
+            and not path.startswith(records.RECORD_DIR + "/")
+            and path != layout.CHANNEL_META
+        ]
+        if not extra:
+            return                      # README·LICENSE 뿐 — 갓 만든 레포다
+        sample = ", ".join(sorted(extra)[:3]) + (" 등" if len(extra) > 3 else "")
+        raise ChannelInitError(
+            f"이 레포에는 이미 내용이 있다 ({sample}). 채널 규약은 **빈 레포에만** "
+            "심는다 — 쓰고 있는 레포에 실수로 커밋하지 않기 위해서다. "
+            "새(빈) 레포를 만들어 그 주소를 쓰거나, 정말 이 레포를 채널로 쓰려면 "
+            f"{layout.CHANNEL_META} 을 직접 커밋해 두어라."
+        )
+
     def _ensure_layout(self) -> None:
         """레포에 gitwire 규약(디렉토리 구조 + 첫 커밋)이 없으면 만든다.
 
         '사용자가 새 repo 를 만들고 URL 만 주면 방이 된다'를 성립시키는 부분.
+        단, **빈 레포에만** 심는다 (`_refuse_if_repo_has_content`).
         """
         self._fetch(quiet=True)
         self._integrate()
         if (self.clone_dir / layout.CHANNEL_META).exists():
             return
+        self._refuse_if_repo_has_content()
         created = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         for rel, data in layout.repo_skeleton(self.name, created).items():
             p = self.clone_dir / rel
