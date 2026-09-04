@@ -158,7 +158,14 @@ def cmd_fetch(args: argparse.Namespace) -> int:
 
 def cmd_history(args: argparse.Namespace) -> int:
     with _channel(args) as ch:
-        recs = ch.history(args.limit)
+        if args.limit:
+            # 페이지 요청 — 다음 쪽 커서(`oldest`)와 종료 조건(`has_more`)까지 준다.
+            page = ch.history_page(before=args.before, limit=args.limit)
+            recs, has_more = page.records, page.has_more
+        else:
+            # limit 없이는 예전과 같이 (before 이전) 전량이다 → 더 있을 수 없다.
+            recs = ch.history(before=args.before)
+            has_more = False
         if args.ndjson:
             for r in recs:
                 _emit(r.to_dict())
@@ -168,6 +175,9 @@ def cmd_history(args: argparse.Namespace) -> int:
                     "ok": True,
                     "command": "history",
                     "count": len(recs),
+                    "before": args.before,
+                    "oldest": recs[0].id if recs else None,
+                    "has_more": has_more,
                     "records": [r.to_dict() for r in recs],
                 }
             )
@@ -177,13 +187,15 @@ def cmd_history(args: argparse.Namespace) -> int:
 def cmd_append(args: argparse.Namespace) -> int:
     payload = _load_payload(args)
     with _channel(args) as ch:
-        rid = ch.append(payload, flush=not args.no_push)
+        # append() 는 이제 Record 를 준다 — ID 에서 시각을 되파싱할 필요가 없다.
+        rec = ch.append(payload, flush=not args.no_push)
         _emit(
             {
                 "ok": True,
                 "command": "append",
-                "id": rid,
-                "sender": ch.sender,
+                "id": rec.id,
+                "sender": rec.sender,
+                "ts": rec.to_dict()["ts"],
                 "pushed": not args.no_push,
             }
         )
@@ -302,9 +314,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--ndjson", action="store_true", help="레코드를 줄 단위로 출력")
     sp.set_defaults(func=cmd_fetch)
 
-    sp = sub.add_parser("history", help="커서와 무관하게 전체 읽기")
+    sp = sub.add_parser("history", help="커서와 무관하게 읽기 (역방향 페이징 가능)")
     common(sp)
-    sp.add_argument("--limit", type=int, default=None, help="최근 N건")
+    sp.add_argument("--limit", type=int, default=None, help="N건 (기본: 전량)")
+    sp.add_argument(
+        "--before",
+        default=None,
+        help="이 레코드 ID 직전부터 거슬러 읽는다 (keyset 커서 — 앞 응답의 oldest)",
+    )
     sp.add_argument("--ndjson", action="store_true")
     sp.set_defaults(func=cmd_history)
 

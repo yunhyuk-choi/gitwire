@@ -62,8 +62,13 @@ def test_append_then_fetch(cli):
     cli("init")
     a = cli("append", "--payload", '{"kind":"msg","body":"안녕"}')
     assert a.returncode == EXIT_OK, a.stderr
-    rid = payload_of(a)["id"]
+    appended = payload_of(a)
+    rid = appended["id"]
     assert rid.startswith("records/")
+    # append() 가 Record 를 돌려주게 되면서 stdout 계약도 봉투 3종을 다 싣는다
+    # (셸 소비자가 ID 에서 시각을 되파싱하지 않아도 된다).
+    assert appended["sender"]
+    assert appended["ts"].endswith("Z")
 
     f = cli("fetch", consumer="reader")
     assert f.returncode == EXIT_OK
@@ -71,6 +76,8 @@ def test_append_then_fetch(cli):
     assert body["count"] == 1
     assert body["records"][0]["payload"] == {"kind": "msg", "body": "안녕"}
     assert body["records"][0]["id"] == rid
+    assert body["records"][0]["sender"] == appended["sender"]
+    assert body["records"][0]["ts"] == appended["ts"]
 
 
 def test_exit_code_10_when_nothing_new(cli):
@@ -122,6 +129,34 @@ def test_no_advance_lets_consumer_ack_explicitly(cli):
     ack = cli("ack", "--record-id", recs[0]["id"], consumer="careful")
     assert ack.returncode == EXIT_OK
     assert payload_of(cli("fetch", consumer="careful"))["count"] == 1
+
+
+def test_history_pages_backwards_from_the_shell(cli):
+    """셸 소비자도 keyset 커서로 과거를 거슬러 읽는다 (전량을 받지 않는다)."""
+    cli("init")
+    for i in range(7):
+        cli("append", "--payload", json.dumps({"i": i}))
+
+    first = payload_of(cli("history", "--limit", "3"))
+    assert [r["payload"]["i"] for r in first["records"]] == [4, 5, 6]
+    assert first["has_more"] is True
+    assert first["oldest"] == first["records"][0]["id"]
+
+    second = payload_of(cli("history", "--limit", "3", "--before", first["oldest"]))
+    assert [r["payload"]["i"] for r in second["records"]] == [1, 2, 3]
+    assert second["has_more"] is True
+
+    third = payload_of(cli("history", "--limit", "3", "--before", second["oldest"]))
+    assert [r["payload"]["i"] for r in third["records"]] == [0]
+    assert third["has_more"] is False
+
+    end = cli("history", "--limit", "3", "--before", third["oldest"])
+    assert end.returncode == EXIT_NO_RECORDS
+    assert payload_of(end)["count"] == 0
+
+    # limit 없이는 예전 그대로 전량이다 (계약을 바꾸지 않았다).
+    everything = payload_of(cli("history"))
+    assert [r["payload"]["i"] for r in everything["records"]] == list(range(7))
 
 
 def test_from_now_skips_backlog(cli):
