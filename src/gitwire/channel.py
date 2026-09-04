@@ -24,6 +24,7 @@ from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
 from .errors import ChannelInitError, GitError, HistoryRewritten, PushRejected
 from .gitcmd import Git, GitRunner, SubprocessGitRunner
+from .treecache import TreeCache
 
 log = logging.getLogger("gitwire")
 
@@ -46,6 +47,14 @@ PUSHED_REF = "refs/gitwire/pushed"
 
 #: 기본 페이지 크기 (역방향 페이징)
 DEFAULT_PAGE = 50
+
+#: "빈 레포" 로 쳐 주는 파일들. forge 가 새 레포를 만들 때 넣어 주는 것들이라
+#: 이게 있다고 해서 "쓰고 있는 레포"는 아니다.
+EMPTY_REPO_FILES = frozenset({
+    "README.md", "README", "README.rst", "readme.md",
+    "LICENSE", "LICENSE.md", "LICENSE.txt", "COPYING",
+    ".gitignore", ".gitattributes",
+})
 
 
 def default_sender(home: Path | str | None = None) -> str:
@@ -173,6 +182,9 @@ class Channel:
         self._closing = threading.Event()
         self._opened = False
         self._attempts: dict[str, int] = {}
+        # 나열 결과 캐시. 키가 sha(내용 주소)라 stale 이 정의상 불가능하다 —
+        # 근거와 크기 제한은 treecache.py 참조.
+        self._trees = TreeCache()
 
         if clock is not None:
             self.clock = clock
@@ -269,15 +281,56 @@ class Channel:
         )
         return res.stdout.strip() or None
 
+    def _repo_contents(self, ref: str) -> list[str]:
+        res = self.git.run("ls-tree", "-r", "--name-only", "-z", ref, check=False)
+        if res.returncode != 0:
+            return []
+        return [p for p in res.stdout.split("\x00") if p]
+
+    def _refuse_if_repo_has_content(self) -> None:
+        """⚠️ **쓰고 있는 레포를 채널로 만들지 않는다.**
+
+        `open()` 은 채널이 아닌 레포를 만나면 규약을 심고 **push 한다.** 그 동작이
+        "주소만 주면 방이 된다"를 성립시키지만, 주소를 잘못 넣으면 *남의(또는 내)
+        코드 레포에 커밋이 올라간다.* 실제로 그렇게 만든 적이 있다 — 인증 실패를
+        시험하려고 진짜 코드 레포 주소를 넣었더니 `gitwire.json` 이 그 레포
+        main 에 push 됐다.
+
+        그래서 규칙을 좁힌다: **빈 레포(또는 README·LICENSE 정도만 있는 새 레포)
+        에만 심는다.** 이미 내용이 있으면 아무것도 쓰지 않고 거부한다.
+        정말 그 레포를 채널로 쓰고 싶으면 `gitwire.json` 을 직접 커밋해 두면 된다
+        (그러면 아래 `CHANNEL_META` 검사에서 이미 채널로 인식된다).
+        """
+        head = self._head()
+        if head is None:
+            return                      # 완전히 빈 레포 — 방으로 만든다
+        extra = [
+            path for path in self._repo_contents(head)
+            if path not in EMPTY_REPO_FILES
+            and not path.startswith(records.RECORD_DIR + "/")
+            and path != layout.CHANNEL_META
+        ]
+        if not extra:
+            return                      # README·LICENSE 뿐 — 갓 만든 레포다
+        sample = ", ".join(sorted(extra)[:3]) + (" 등" if len(extra) > 3 else "")
+        raise ChannelInitError(
+            f"이 레포에는 이미 내용이 있다 ({sample}). 채널 규약은 **빈 레포에만** "
+            "심는다 — 쓰고 있는 레포에 실수로 커밋하지 않기 위해서다. "
+            "새(빈) 레포를 만들어 그 주소를 쓰거나, 정말 이 레포를 채널로 쓰려면 "
+            f"{layout.CHANNEL_META} 을 직접 커밋해 두어라."
+        )
+
     def _ensure_layout(self) -> None:
         """레포에 gitwire 규약(디렉토리 구조 + 첫 커밋)이 없으면 만든다.
 
         '사용자가 새 repo 를 만들고 URL 만 주면 방이 된다'를 성립시키는 부분.
+        단, **빈 레포에만** 심는다 (`_refuse_if_repo_has_content`).
         """
         self._fetch(quiet=True)
         self._integrate()
         if (self.clone_dir / layout.CHANNEL_META).exists():
             return
+        self._refuse_if_repo_has_content()
         created = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         for rel, data in layout.repo_skeleton(self.name, created).items():
             p = self.clone_dir / rel
@@ -564,32 +617,63 @@ class Channel:
             return []
         return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
 
-    def _list_days(self, ref: str) -> list[str]:
-        """`records/` 바로 아래 날짜 디렉토리 이름 (오름차순). **비재귀**다."""
-        res = self.git.run(
-            "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False
-        )
-        if res.returncode != 0:
-            return []
-        days = []
-        for entry in res.stdout.split("\x00"):
-            if not entry:
-                continue
-            meta, _, path = entry.partition("\t")
-            fields = meta.split()
-            if len(fields) >= 2 and fields[1] == "tree" and path:
-                days.append(path.rsplit("/", 1)[-1])
-        return sorted(days)
+    def _day_trees(self, ref: str) -> list[tuple[str, str]]:
+        """`records/` 바로 아래 (날짜, 트리 sha) 목록. 오름차순, **비재귀** 1회 호출.
 
-    def _list_day(self, ref: str, day: str) -> list[str]:
-        """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순)."""
-        res = self.git.run(
-            "ls-tree", "--name-only", "-z", ref,
-            "--", f"{records.RECORD_DIR}/{day}/", check=False,
-        )
-        if res.returncode != 0:
-            return []
-        return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
+        날짜 이름과 그 디렉토리의 트리 sha 가 **한 번의 호출로 같이 나온다** —
+        sha 를 따로 물어보는 왕복이 없다는 것이 이 형태를 고른 이유다.
+        결과는 커밋 sha 로 캐시한다(같은 커밋 = 같은 트리 = 같은 목록).
+        """
+        key = "days:" + ref
+        cached = self._trees.get(key)
+        if cached is None:
+            res = self.git.run(
+                "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False
+            )
+            rows = []
+            if res.returncode == 0:
+                for entry in res.stdout.split("\x00"):
+                    if not entry:
+                        continue
+                    meta, _, path = entry.partition("\t")
+                    fields = meta.split()
+                    if len(fields) >= 3 and fields[1] == "tree" and path:
+                        # "<트리 sha> <날짜>" 로 한 줄에 담는다 (캐시 값은 문자열 목록).
+                        rows.append(f"{fields[2]} {path.rsplit('/', 1)[-1]}")
+            cached = self._trees.put(key, sorted(rows, key=lambda r: r.split(" ", 1)[1]))
+        out = []
+        for row in cached:
+            sha, _, day = row.partition(" ")
+            out.append((day, sha))
+        return out
+
+    def _day_records(self, day: str, tree: str) -> list[str]:
+        """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순).
+
+        **트리 sha 로 직접 나열하고 그 sha 로 캐시한다.** 커밋이 아니라 트리를
+        키로 쓰는 것이 더 촘촘하다 — 새 레코드가 오늘 날짜에 추가돼도 어제
+        날짜의 트리 sha 는 그대로라 캐시가 계속 맞는다. 반대로 그 날짜에 무엇이든
+        추가되면 sha 가 달라지므로 **낡은 목록이 나올 수 없다**(무효화 불필요).
+
+        캐시에는 파일명만 담고 `records/<날짜>/` 접두는 쓸 때 붙인다 — 값이
+        접두와 무관하므로 키(sha)와 값이 어긋날 여지가 아예 없다.
+        """
+        key = "tree:" + tree
+        names = self._trees.get(key)
+        if names is None:
+            res = self.git.run("ls-tree", "--name-only", "-z", tree, check=False)
+            found = (
+                sorted(n for n in res.stdout.split("\x00") if n.endswith(".json"))
+                if res.returncode == 0
+                else []
+            )
+            names = self._trees.put(key, found)
+        prefix = f"{records.RECORD_DIR}/{day}/"
+        return [prefix + n for n in names]
+
+    def cache_info(self) -> dict:
+        """나열 캐시 상태 (관측용). 키가 sha 라 무효화 항목은 없다."""
+        return self._trees.info()
 
     def _ids_before(
         self, ref: str, before: str | None = None, limit: int | None = None
@@ -606,13 +690,15 @@ class Channel:
           건너뛴다. 필요한 개수를 채우는 순간 멈춘다 → 방문한 디렉토리 수는
           `O(요청 건수 / 하루 레코드 수)` 이고, 실제로 여는 blob 은 딱 요청한 만큼이다.
           (전량 나열 후 잘라내면 대화가 길수록 선형으로 느려진다.)
+        * 나열 결과는 **sha 로 캐시**되므로, 무한 스크롤처럼 같은 상태를 반복
+          조회하는 경로에서는 git 호출이 0회가 된다 (treecache.py).
         """
         out: list[str] = []
-        for day in reversed(self._list_days(ref)):
+        for day, tree in reversed(self._day_trees(ref)):
             prefix = f"{records.RECORD_DIR}/{day}/"
             if before is not None and prefix > before:
                 continue                      # 이 날짜 전체가 커서보다 뒤다 — 열지 않는다
-            names = self._list_day(ref, day)
+            names = self._day_records(day, tree)
             if before is not None:
                 names = [n for n in names if n < before]
             if limit is None:

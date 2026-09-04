@@ -16,6 +16,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+import pytest
+
 import gitwire
 from gitwire.clock import FixedOffsetClock
 
@@ -396,3 +398,79 @@ def test_shallow_clone_works(bare_repo, homes, participant):
         assert 6 in [r.payload["i"] for r in b.fetch_new()]
     finally:
         shallow.close()
+
+
+# ------------------------------------------- 7. 아무 레포나 채널로 만들지 않는다
+
+
+def _seed_repo(bare_repo: Path, tmp_path: Path, files: dict) -> str:
+    """bare 레포에 내용을 하나 넣어 둔다 (이미 쓰고 있는 레포를 흉내낸다)."""
+    work = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(bare_repo), str(work)], check=True,
+                   capture_output=True)
+    for name, text in files.items():
+        path = work / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8", newline="\n")
+    for args in (["add", "-A"], ["commit", "-m", "기존 내용"],
+                 ["push", "origin", "HEAD:refs/heads/main"]):
+        subprocess.run(["git", *args], cwd=str(work), check=True, capture_output=True)
+    return subprocess.run(
+        ["git", f"--git-dir={bare_repo}", "rev-parse", "main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_refuses_to_turn_a_repo_with_content_into_a_channel(bare_repo, tmp_path, homes):
+    """⭐ 주소를 잘못 넣으면 **쓰고 있는 레포에 커밋이 올라간다** — 그걸 막는다.
+
+    실제로 그런 사고가 있었다: 인증 실패를 시험하려고 진짜 코드 레포 주소를
+    넣었더니 gitwire.json 이 그 레포 main 에 push 됐다.
+    """
+    before = _seed_repo(bare_repo, tmp_path, {
+        "src/app.py": "print('안녕')\n", "README.md": "# 내 프로젝트\n",
+    })
+
+    with pytest.raises(gitwire.ChannelInitError) as caught:
+        gitwire.Channel(str(bare_repo), home=homes("careless"), sender="oops",
+                        clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+    assert "빈 레포" in str(caught.value)
+
+    # ⭐ 지상검증 — 원격이 **한 글자도** 바뀌지 않았다.
+    after = subprocess.run(
+        ["git", f"--git-dir={bare_repo}", "rev-parse", "main"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert after == before, "거부했다면서 원격에 커밋을 올렸다"
+    listing = subprocess.run(
+        ["git", f"--git-dir={bare_repo}", "ls-tree", "-r", "--name-only", "main"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "gitwire.json" not in listing
+
+
+def test_still_initializes_a_fresh_repo_with_readme_and_license(bare_repo, tmp_path, homes):
+    """forge 가 만들어 주는 README·LICENSE 는 '빈 레포'로 친다 (흔한 경우다)."""
+    _seed_repo(bare_repo, tmp_path, {
+        "README.md": "# our-room\n", "LICENSE": "MIT\n", ".gitignore": "*.pyc\n",
+    })
+    channel = gitwire.Channel(str(bare_repo), home=homes("fresh"), sender="alice",
+                              clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+    try:
+        assert (channel.clone_dir / "gitwire.json").exists()
+        rec = channel.append({"n": 1}, flush=True)
+        assert [r.id for r in channel.history()] == [rec.id]
+    finally:
+        channel.close()
+
+
+def test_existing_channel_still_opens(bare_repo, homes, participant):
+    """이미 채널인 레포는 그대로 열린다 (가드가 정상 경로를 막지 않는다)."""
+    first = participant("alice")
+    first.append({"n": 1}, flush=True)
+    second = gitwire.Channel(str(bare_repo), home=homes("second"), sender="bob",
+                             clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+    try:
+        assert [r.payload["n"] for r in second.history()] == [1]
+    finally:
+        second.close()
