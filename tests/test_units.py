@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -335,6 +336,54 @@ def test_git_calls_never_prompt():
     g = gitcmd.Git(runner, Path("."))
     g.run("fetch")
     assert runner.calls[0][:2] == ["-c", "core.autocrlf=false"]
+
+
+# ------------------------------------------------- Windows 콘솔 창 억제
+
+
+def test_windows_git_is_spawned_without_a_console_window(monkeypatch):
+    """⭐ Windows 에서 ``CREATE_NO_WINDOW`` 가 **실제 호출에** 걸려 있어야 한다.
+
+    이 단언이 없으면 플래그가 빠져도 아무 테스트가 깨지지 않는다 — 콘솔 없는
+    프로세스(``pythonw.exe`` 로 띄운 앱·서비스)에서 git 호출마다 빈 창이
+    깜빡이는 것으로만 드러난다. 그건 남의 데스크탑에서만 보이는 회귀다.
+
+    **창을 실제로 세지 않는다** — 세려면 창을 띄워야 하고, 그러면 이 테스트가
+    돌 때마다 사용자 화면에 창이 깜빡인다. 우리가 통제하는 것은 플래그이므로
+    플래그를 단언한다.
+    """
+    monkeypatch.setattr(gitcmd.os, "name", "nt")
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, b"ok", b"")
+
+    monkeypatch.setattr(gitcmd.subprocess, "run", fake_run)
+    result = gitcmd.SubprocessGitRunner().run(["status"], timeout=5.0)
+
+    expected = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert seen["kwargs"]["creationflags"] & expected == expected, (
+        "git 이 CREATE_NO_WINDOW 없이 떠 있다 — 콘솔 없는 부모에서 빈 창이 깜빡인다"
+    )
+    # 창을 없앤 대신 잃은 것이 없어야 한다.
+    assert seen["kwargs"]["capture_output"] is True, "출력 캡처가 이 라이브러리의 근간이다"
+    assert seen["kwargs"]["timeout"] == 5.0
+    assert seen["kwargs"]["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert seen["kwargs"]["env"]["GCM_INTERACTIVE"] == "never"
+    assert result.stdout == "ok"
+
+
+def test_non_windows_keeps_flags_at_zero(monkeypatch):
+    """macOS·리눅스에는 콘솔 개념이 없다 — 플래그가 0 이라 동작이 그대로다.
+
+    (POSIX 에서 ``creationflags`` 가 0 이 아니면 ``subprocess`` 가 ValueError 를
+    던진다. 0 을 넘기는 것은 아무 일도 하지 않는다.)
+    """
+    for name in ("posix", "java"):
+        monkeypatch.setattr(gitcmd.os, "name", name)
+        assert gitcmd.creation_flags() == 0
 
 
 # ---------------------------------------------------------------- cursor
