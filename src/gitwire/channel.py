@@ -23,6 +23,7 @@ from . import clock as _clock
 from . import identity, layout, records
 from . import localrefs as _localrefs
 from . import rollup as _rollup
+from . import state as _state
 from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
 from .errors import ChannelInitError, GitError, HistoryRewritten, PushRejected
@@ -46,6 +47,24 @@ MODE_SCAN = "scan"   # 전량 나열 + 워터마크 (첫 소비 / 히스토리 �
 #: shallow 클론에서는 원격 커밋과의 조상 관계를 로컬에서 판정할 수 없기 때문에
 #: (히스토리가 잘려 있다) 미푸시 여부를 이 마커로 판단한다.
 PUSHED_REF = "refs/gitwire/pushed"
+
+#: 미푸시 커밋을 원격 위로 옮겨 심을 때(rebase) 쓰는 충돌 규약.
+#:
+#: ⭐ **레코드는 여기 걸리지 않는다** — 한 레코드 = 한 파일이고 파일명이
+#: `<밀리초 타임스탬프>-<발신자>-<난수6>` 이라 두 참가자가 같은 경로를 만드는 일이
+#: 사실상 없다. 지난 날짜 롤업도 자기 커밋을 fast-forward 로만 올리므로(`rollup()`)
+#: 이 경로를 타지 않는다.
+#:
+#: 실제로 같은 경로가 겹칠 수 있는 것은 **참가자 상태 예약 경로 하나**이고
+#: (`state.py` — 한 사람이 노트북·데스크탑을 함께 쓰면 같은 파일이다),
+#: 그때는 **지금 replay 되는 우리 값이 이긴다**(rebase 의 `theirs` = 옮겨 심는
+#: 쪽). 값이 단조 증가여야 하는 소비자는 쓰기 전에 저장된 값을 읽어 `max` 를
+#: 취하므로, 뒤처진 값이 이겨도 다음 갱신에서 회복된다.
+#:
+#: ⚠️ 이 플래그가 없으면 그 한 파일의 충돌이 rebase 실패 → `HistoryRewritten` 이
+#: 되어 **메시지 전송까지 막힌다.** 읽음 표시 같은 부수 상태가 대화를 멈추게
+#: 하는 것이 최악이므로, 충돌 해소 규칙을 미리 못 박는다.
+_REBASE_RESOLVE = ("-X", "theirs")
 
 
 #: 기본 페이지 크기 (역방향 페이징)
@@ -252,6 +271,10 @@ class Channel:
         self._lock = threading.RLock()
         self._remote = threading.RLock()
         self._pending: list[str] = []
+        # 아직 커밋되지 않은 **참가자 상태** 경로 (`state.py`). 레코드와 따로
+        # 세는 이유: 레코드는 "사건 N건"이고 이쪽은 "값을 덮어썼다"라 커밋
+        # 메시지·건수의 의미가 다르다. 둘 다 같은 커밋으로 나간다.
+        self._pending_state: set[str] = set()
         self._pending_since: float | None = None
         self._flush_cv = threading.Condition(self._lock)
         self._flusher: threading.Thread | None = None
@@ -462,6 +485,8 @@ class Channel:
             path for path in self._repo_contents(head)
             if path not in EMPTY_REPO_FILES
             and not path.startswith(records.RECORD_DIR + "/")
+            and not path.startswith(_rollup.ARCHIVE_DIR + "/")
+            and not path.startswith(_state.STATE_DIR + "/")
             and path != layout.CHANNEL_META
         ]
         if not extra:
@@ -544,18 +569,42 @@ class Channel:
         if res.returncode != 0 and not quiet:
             raise GitError(args, res.returncode, res.stderr)
 
-    def _absorb_worktree(self) -> None:
-        """작업 사본에 남은 미커밋 레코드를 먼저 커밋한다.
+    def _commit_specs(self) -> list[str]:
+        """커밋 대상 경로 — 레코드 + **참가자 상태 예약 경로**.
 
-        아래 통합 로직은 `reset --hard` 를 쓸 수 있는데, 그건 **미커밋 레코드
-        파일을 지운다.** 파괴적 동작 전에 항상 흡수해서 데이터를 잃지 않는다.
+        ⭐ 한 번의 `git add` 로 둘을 함께 스테이징한다 (레코드를 발행할 때마다 도는
+        경로라 호출 수를 늘리지 않는다). 예약 경로는 **로컬에 실제로 있을 때만**
+        pathspec 에 넣는다 — 없는 경로를 주면 git 이 `pathspec did not match` 로
+        실패하고, 그러면 같은 호출에 실려 있던 **레코드까지 스테이징되지 않는다**
+        (참가자 상태를 모르는 옛 채널에서 발행이 조용히 멈추는 사고가 된다).
+        """
+        specs = [records.RECORD_DIR]
+        if (self.clone_dir / _state.STATE_DIR).exists():
+            specs.append(_state.STATE_DIR)
+        return specs
+
+    def _commit_message(self) -> str:
+        """이번 커밋이 무엇을 담았는지 한 줄. 레코드와 상태를 섞어 적는다."""
+        n = len(self._pending)
+        m = len(self._pending_state)
+        if n and m:
+            return f"gitwire: {n} record(s) + 참가자 상태 {m}건"
+        if m:
+            return f"gitwire: 참가자 상태 {m}건"
+        return f"gitwire: {n or 1} record(s)"
+
+    def _absorb_worktree(self) -> None:
+        """작업 사본에 남은 미커밋 레코드·참가자 상태를 먼저 커밋한다.
+
+        아래 통합 로직은 `reset --hard` 를 쓸 수 있는데, 그건 **미커밋 파일을
+        지운다.** 파괴적 동작 전에 항상 흡수해서 데이터를 잃지 않는다.
         """
         g = self.git
-        g.run("add", "-A", "--", records.RECORD_DIR, check=False)
+        g.run("add", "-A", "--", *self._commit_specs(), check=False)
         if g.run("diff", "--cached", "--quiet", check=False).returncode != 0:
-            n = len(self._pending) or 1
-            g.run("commit", "-m", f"gitwire: {n} record(s)")
+            g.run("commit", "-m", self._commit_message())
         self._pending.clear()
+        self._pending_state.clear()
         self._pending_since = None
 
     def _mark_pushed(self, sha: str | None = None) -> None:
@@ -574,7 +623,7 @@ class Channel:
         )
         if res.returncode == 0:
             return int(res.stdout.strip() or "0")
-        return len(self._pending)
+        return len(self._pending) + len(self._pending_state)
 
     def _integrate(self) -> None:
         """fetch 결과를 로컬 브랜치에 반영한다.
@@ -611,14 +660,15 @@ class Channel:
         # 미푸시 커밋이 있다. 그것만 원격 위로 옮겨 심는다.
         if g.ok("rev-parse", "--verify", "--quiet", PUSHED_REF):
             if g.run(
-                "rebase", "--onto", remote, PUSHED_REF, "HEAD", check=False
+                "rebase", *_REBASE_RESOLVE, "--onto", remote, PUSHED_REF, "HEAD",
+                check=False,
             ).returncode == 0:
                 g.run("branch", "-f", self.branch, "HEAD", check=False)
                 g.run("checkout", self.branch, check=False)
                 return
             g.run("rebase", "--abort", check=False)
         if g.ok("merge-base", head, remote):
-            if g.run("rebase", remote, check=False).returncode == 0:
+            if g.run("rebase", *_REBASE_RESOLVE, remote, check=False).returncode == 0:
                 return
             g.run("rebase", "--abort", check=False)
         raise HistoryRewritten(
@@ -778,12 +828,16 @@ class Channel:
         )
         self._flusher.start()
 
+    def _has_pending(self) -> bool:
+        """아직 커밋되지 않은 것이 있나 (레코드 **또는** 참가자 상태)."""
+        return bool(self._pending or self._pending_state)
+
     def _flush_loop(self) -> None:
         while not self._closing.is_set():
             with self._flush_cv:
-                if not self._pending:
+                if not self._has_pending():
                     self._flush_cv.wait(timeout=self.batch_window)
-                    if not self._pending:
+                    if not self._has_pending():
                         return
                 since = self._pending_since or time.monotonic()
                 wait = self.batch_window - (time.monotonic() - since)
@@ -865,6 +919,148 @@ class Channel:
             with self._lock:
                 self._mark_pushed(head)      # 방금 **실제로** 올린 sha 를 기록
             return
+
+    # ------------------------------------------- 참가자 상태 (예약 경로)
+    #
+    # ⚠️ 레코드가 아니다. 개념·경계·안전성 근거는 `state.py` 모듈 도크에 있고
+    # 여기 복제하지 않는다. 이 창구가 좁은 이유도 그 문서 하나로 설명된다:
+    # 기반이 하는 일은 "예약 경로의 파일 하나를 읽고 쓰는 것"뿐이고, 값의 뜻과
+    # 병합 규칙(단조 증가 등)은 전부 소비자 것이다.
+
+    def state_path(self, key: str) -> str:
+        """`key` 참가자의 상태 파일 경로 (채널 레포 기준 상대 경로)."""
+        return _state.state_path(key)
+
+    def state_exists(self, key: str) -> bool:
+        """그 참가자의 상태 파일이 이미 있나 — **로컬 stat 한 번** (git 0개).
+
+        "처음 들어온 방이면 내 파일을 만든다"를 판정하는 자리다. 작업 사본은
+        원격의 체크아웃이므로 추적된 파일은 디스크에 있다 — 그래서 git 을 부를
+        이유가 없다. 이 판정을 매 방 열기마다 하고도 비용이 0인 것이 요점이다.
+        """
+        self.open()
+        return (self.clone_dir / _state.state_path(key)).exists()
+
+    def _state_index(self, ref: str) -> dict[str, str]:
+        """{참가자 키 → blob sha}. **`ls-tree` 한 번**, 커밋 sha 로 캐시.
+
+        같은 커밋을 다시 물어보면 git 호출이 0회다(`treecache.py` — 키가 sha 라
+        stale 이 정의상 불가능하다). 참가자 상태는 폴 주기마다 되풀이해 읽히므로
+        이 성질이 없으면 유휴 비용이 늘어난다.
+        """
+        key = "state:" + ref
+        cached = self._trees.get(key)
+        if cached is None:
+            res = self.git.run(
+                "ls-tree", "-z", ref, "--", _state.STATE_DIR + "/", check=False
+            )
+            rows: list[str] = []
+            if res.returncode == 0:
+                for entry in res.stdout.split("\x00"):
+                    if not entry:
+                        continue
+                    meta, _, path = entry.partition("\t")
+                    fields = meta.split()
+                    if len(fields) < 3 or fields[1] != "blob":
+                        continue
+                    who = _state.key_from_path(path)
+                    if who:
+                        rows.append(f"{fields[2]} {who}")
+            cached = self._trees.put(key, sorted(rows, key=lambda r: r.split(" ", 1)[1]))
+        out: dict[str, str] = {}
+        for row in cached:
+            sha, who = row.split(" ", 1)
+            out[who] = sha
+        return out
+
+    def _read_state(self, who: str, sha: str) -> _state.ParticipantState | None:
+        """상태 blob 하나 → `ParticipantState`. 해석 실패는 **건너뛴다**.
+
+        남이 쓴 파일이고 우리보다 새 버전이 썼을 수도 있다 — 한 참가자의 파일이
+        깨졌다고 나머지 참가자를 읽지 못하게 만들지 않는다. 대신 조용히 넘기지
+        않고 로그에 남긴다.
+        """
+        rel = _state.state_path(who)
+        try:
+            return _state.decode(self._blob_bytes(sha, rel), who)
+        except (GitError, _state.StateDecodeError, _rollup.ArchiveFormatError) as exc:
+            log.warning("gitwire: 참가자 상태를 읽지 못했다 (%s): %s", rel, exc)
+            return None
+
+    def read_states(self, *, fresh: bool = False) -> dict[str, _state.ParticipantState]:
+        """참가자 상태 **전부** ({키: 상태}).
+
+        ⭐ 전량을 그대로 읽는 것이 옳은 유일한 경로다 — 개수의 상한이 **참가자
+        수**이고 사건 수와 무관하기 때문이다(레코드는 그래서 커서·페이징을 쓴다).
+
+        기본이 `fresh=False` 인 것도 레코드 읽기와 같은 이유다 (`_read_head()` 의
+        「신선도 정책」) — 신선도는 구독(폴러)이 맡는다.
+        """
+        head = self._read_head(fresh)
+        with self._lock:
+            if head is None:
+                return {}
+            out: dict[str, _state.ParticipantState] = {}
+            for who, sha in self._state_index(head).items():
+                got = self._read_state(who, sha)
+                if got is not None:
+                    out[who] = got
+            return out
+
+    def read_state(
+        self, key: str, *, fresh: bool = False
+    ) -> _state.ParticipantState | None:
+        """참가자 한 명의 지금 값. 없으면 None."""
+        who = _state.state_key(key)
+        head = self._read_head(fresh)
+        with self._lock:
+            if head is None:
+                return None
+            sha = self._state_index(head).get(who)
+            return self._read_state(who, sha) if sha else None
+
+    def write_state(
+        self,
+        key: str,
+        value: Any,
+        *,
+        identity: str | None = None,
+        flush: bool = False,
+    ) -> str:
+        """참가자 하나의 상태를 **덮어쓴다**. 반환값은 그 경로.
+
+        ⚠️ **자기 키에만 쓴다** — 그 규율이 이 API 의 안전성 근거다 (`state.py`:
+        경로마다 쓰는 사람이 한 명). 기반은 키가 누구 것인지 알 수 없어 검사하지
+        않는다.
+
+        `append()` 와 같은 모양으로 동작한다: 파일은 **즉시 디스크에 쓰이고**,
+        커밋·push 는 배칭 창 안에서 다른 대기분과 함께 한 커밋으로 나간다.
+        그래서 이 호출이 네트워크를 기다리지 않고, 부수 상태(읽음 표시 등)의
+        발행이 메시지 전송보다 앞서 끼어들지도 않는다 — 같은 커밋에 실려 간다.
+        """
+        who = _state.state_key(key)
+        rel = _state.state_path(who)
+        # ⚠️ 시계는 락 **밖에서** 본다 (`HttpDateClock.now()` 는 네트워크 왕복일
+        # 수 있고, 그 순간 읽기·쓰기가 통째로 막힌다 — `maybe_rollup` 과 같은 규율).
+        ts = self.clock.now()
+        data = _state.encode(who, identity if identity is not None else key, value, ts)
+        with self._lock:
+            self.open()
+            path = self.clone_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+            # 캐시는 커밋 sha 로 키가 잡혀 있어 손댈 필요가 없다 (아직 커밋 전이라
+            # 어느 커밋의 목록도 바뀌지 않았다).
+            self._pending_state.add(rel)
+            if self._pending_since is None:
+                self._pending_since = time.monotonic()
+            need_now = flush or self.batch_window <= 0
+            if not need_now:
+                self._ensure_flusher()
+                self._flush_cv.notify_all()
+        if need_now:
+            self.flush()
+        return rel
 
     # ----------------------------------------------------------------- 읽기
 
@@ -1466,8 +1662,21 @@ class Channel:
         *,
         interval: float | None = None,
         on_error: Callable[[Any, BaseException], None] | None = None,
+        on_cycle: Callable[[str | None], None] | None = None,
     ) -> Subscription:
-        """⭐ 상시 구독 — 백그라운드 루프가 새 레코드만 골라 콜백으로 넘긴다."""
+        """⭐ 상시 구독 — 백그라운드 루프가 새 레코드만 골라 콜백으로 넘긴다.
+
+        `on_cycle` — **한 폴 주기가 끝났음**을 알리는 훅 (인자: 그 시점의 로컬
+        HEAD sha, 없으면 None). 레코드가 0건이어도 불린다.
+
+        왜 필요한가: 원격 변화 중에는 **레코드가 아닌 것**도 있다 (예약 경로의
+        참가자 상태 — `state.py`). 그런 커밋은 배달할 레코드가 없으므로 `callback`
+        만으로는 소비자가 "무언가 바뀌었다"를 알 수 없고, 그러면 소비자가 자기
+        폴링 스레드를 하나 더 두게 된다 — **원격을 보는 곳이 둘이 되는 것**이
+        이 훅을 넣지 않은 대가다. 폴링은 한 군데서만 돈다.
+
+        훅에서 난 예외는 폴링을 죽이지 않는다 (`on_error` 로 넘기거나 로그로).
+        """
         self.open()
         stop = threading.Event()
         period = interval if interval is not None else self.poll_interval
@@ -1476,6 +1685,8 @@ class Channel:
             while not stop.is_set():
                 try:
                     self.poll_once(callback, on_error=on_error)
+                    if on_cycle is not None:
+                        on_cycle(self.local_head())
                 except BaseException as exc:  # noqa: BLE001
                     if on_error:
                         try:
@@ -1827,6 +2038,7 @@ class Channel:
                 },
                 "clock_offset": round(float(getattr(self.clock, "offset", 0.0)), 3),
                 "pending": len(self._pending),
+                "pending_state": len(self._pending_state),
                 "auto_rollup": self.auto_rollup,
                 "archives": len(self._archive_index(self._head()))
                 if self._head()
@@ -1840,7 +2052,7 @@ class Channel:
         with self._flush_cv:
             self._flush_cv.notify_all()
         try:
-            if self._pending:
+            if self._has_pending():
                 self.flush()
         finally:
             if self._flusher and self._flusher.is_alive():

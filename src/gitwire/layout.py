@@ -33,7 +33,9 @@
 채널 레포(공유되는 쪽) 안
 ------------------------
     gitwire.json        채널 메타 (포맷 버전)
-    records/<날짜>/*.json
+    records/<날짜>/*.json       append-only 레코드 (사건)
+    archive/<날짜>.jsonl        지난 날짜 롤업 (rollup.py — 레코드를 옮긴 것)
+    participants/<키>.json      참가자별 **가변** 상태 (state.py — 레코드가 아니다)
     .gitattributes      모든 파일 바이트 보존 (CRLF 변환 금지)
     README.md           레포를 직접 열어본 사람을 위한 안내
 """
@@ -58,6 +60,10 @@ _REPO_README = """# gitwire 채널 레포
 저장소다. 사람이 직접 편집하지 않는다.
 
 * `records/<날짜>/*.json` — append-only 레코드. 한 건 = 한 파일. 수정·삭제하지 않는다.
+* `archive/<날짜>.jsonl` — 지난 날짜의 레코드를 하루 1파일로 접은 것 (한 줄 = 한 건).
+  레코드를 버리지 않는다 — 저장 위치만 옮기고 id 는 그대로다.
+* `participants/<키>.json` — 참가자별 **가변** 상태. 레코드가 아니다(덮어쓴다).
+  **한 파일의 쓰기자는 그 참가자 한 명**이고, 그 성질이 동시 갱신의 안전성 근거다.
 * `gitwire.json` — 채널 메타데이터.
 
 레코드의 `payload` 스키마는 이 레포를 쓰는 **소비자 애플리케이션**이 정한다.
@@ -145,4 +151,8 @@ def repo_skeleton(channel_name: str | None, created_at: str) -> dict[str, bytes]
         "README.md": _REPO_README.encode("utf-8"),
         ".gitattributes": _REPO_GITATTRIBUTES.encode("utf-8"),
         "records/.gitkeep": b"",
+        # 참가자 상태 예약 경로 (`state.py`). 빈 채널에도 심어 둔다 — 레포를
+        # 열어본 사람이 이 경로가 규약임을 바로 알 수 있고, 커밋 대상 pathspec
+        # 이 처음부터 성립한다 (`Channel._commit_specs()`).
+        "participants/.gitkeep": b"",
     }
