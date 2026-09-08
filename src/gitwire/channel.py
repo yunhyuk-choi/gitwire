@@ -21,6 +21,7 @@ from typing import Any, Callable, Sequence
 
 from . import clock as _clock
 from . import identity, layout, records
+from . import localrefs as _localrefs
 from . import rollup as _rollup
 from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
@@ -220,7 +221,18 @@ class Channel:
         self.cursors = CursorStore(self.dir, consumer)
         self.consumer = self.cursors.consumer
 
-        self._runner = runner or SubprocessGitRunner()
+        # ⭐ 로컬 ref 캐시 (`localrefs.py`) — 유휴 폴링에서 `rev-parse` 를 없앤다.
+        #
+        # 러너를 `GuardedRunner` 로 감싼다: 이 채널의 **모든** git 호출이 그 하나를
+        # 지나므로(임시 인덱스를 쓰는 롤업 경로와 `identity` 조회까지) 로컬을 바꾸는
+        # 호출이 새로 생겨도 무효화를 빠뜨릴 수 없다. 판정은 읽기 전용 화이트리스트이고
+        # 모르는 서브커맨드는 위험한 쪽(= 무효화)으로 분류한다 (fail-safe).
+        self._localrefs = _localrefs.LocalRefCache(
+            self.clone_dir, refs=(f"refs/remotes/origin/{branch}",)
+        )
+        self._runner = _localrefs.GuardedRunner(
+            runner or SubprocessGitRunner(), self._localrefs
+        )
         # ⭐ 락이 둘이다. **순서는 언제나 `_remote` → `_lock`** 이며 그 반대는 없다.
         #
         # `_lock`   : 작업 사본·인덱스·`_pending`·커서·캐시를 만지는 **짧은 로컬**
@@ -393,11 +405,30 @@ class Channel:
         return self.git.ok("rev-parse", "--verify", "--quiet", "HEAD")
 
     def _head(self) -> str | None:
+        """로컬 HEAD 의 sha. **유휴에서는 git 을 부르지 않는다** (`localrefs.py`).
+
+        예전에는 폴링마다 `rev-parse` 프로세스가 하나 떴다. 유휴에서 로컬 HEAD 는
+        바뀌지 않으므로 매번 물어볼 이유가 없다 — 캐시가 유효한지는 `.git` 안
+        ref 파일의 스탬프로 확인한다(프로세스 0개). 밖에서 사람이 이 클론에
+        git 명령을 돌려도 그 스탬프가 달라지므로 즉시 다시 묻는다.
+        """
+        return self._localrefs.resolve("HEAD", self._resolve_head)
+
+    def _resolve_head(self) -> str | None:
         res = self.git.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
         return res.stdout.strip() or None
 
     def _remote_ref(self) -> str | None:
-        """마지막으로 알고 있는 원격 상태 (remote-tracking ref)."""
+        """마지막으로 알고 있는 원격 상태 (remote-tracking ref).
+
+        `_head()` 와 같은 캐시를 쓴다 — 이 ref 는 우리가 `fetch` 할 때만 바뀌고,
+        그때 파일이 바뀌므로 스탬프가 알려 준다.
+        """
+        return self._localrefs.resolve(
+            f"refs/remotes/origin/{self.branch}", self._resolve_remote_ref
+        )
+
+    def _resolve_remote_ref(self) -> str | None:
         res = self.git.run(
             "rev-parse", "--verify", "--quiet",
             f"refs/remotes/origin/{self.branch}", check=False,
@@ -1026,6 +1057,15 @@ class Channel:
         """나열 캐시 상태 (관측용). 키가 sha 라 무효화 항목은 없다."""
         return self._trees.info()
 
+    def local_ref_cache_info(self) -> dict:
+        """로컬 ref 캐시 상태 (관측용) — `localrefs.py`.
+
+        적중·무효화·**포기**(스탬프를 만들 수 없어 매번 git 을 부른 횟수) 횟수를
+        드러낸다. 캐시가 조용히 꺼져 있거나 조용히 계속 어긋나는 상태를 밖에서
+        볼 수 있어야 한다.
+        """
+        return self._localrefs.info()
+
     def _ids_before(
         self, ref: str, before: str | None = None, limit: int | None = None
     ) -> list[str]:
@@ -1181,6 +1221,17 @@ class Channel:
             return None, [], MODE_SCAN
         target = head
         base = cur.commit
+        if base == target and cur.batch_pos == 0:
+            # ⭐ 유휴 — 기준 커밋이 곧 목표 커밋이다. 그러면 답이 **계산 없이**
+            # 정해진다: 도달 가능성(방금 로컬에서 읽은 커밋이다)·조상 관계(자기
+            # 자신)·diff(자기와의 차이 = 공집합)가 모두 자명하다. 예전에는 이
+            # 자명한 세 가지를 확인하려고 폴링마다 git 을 4개(`cat-file -e`,
+            # `merge-base --is-ancestor`, `diff` 2회) 띄웠다.
+            #
+            # ⚠️ `batch_pos == 0` 조건이 필요하다. 전달 중간에 끊긴 배치가 있으면
+            # (batch_pos > 0) 그 배치를 **같은 목표 커밋으로 재계산**해야 하므로
+            # 아래 정상 경로를 그대로 타야 한다.
+            return target, [], MODE_DIFF
         if (
             cur.batch_pos > 0
             and self._reachable(cur.batch_head)
