@@ -29,6 +29,10 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
 
     # 상시 구독 (루프를 도는 소비자 — 웹앱 등)
     sub = ch.subscribe(lambda rec: print(rec.payload))
+
+    # 참가자별 **가변** 상태 (레코드가 아니다 — `state.py` 참조)
+    ch.write_state("me@example.com", {"cursor": "records/2026.../….json"})
+    states = ch.read_states()        # {키: ParticipantState}
 """
 
 from .channel import (
@@ -58,9 +62,17 @@ from .errors import (
 )
 from .gitcmd import GitRunner, SubprocessGitRunner
 from .hub import Hub
-from .identity import installation_id
+from .identity import git_email, installation_id
 from .layout import channel_dir, gitwire_home, normalize_repo_url
 from .records import Record
+from .state import (
+    STATE_DIR,
+    STATE_VERSION,
+    ParticipantState,
+    StateDecodeError,
+    state_key,
+    state_path,
+)
 from .rollup import (
     ARCHIVE_DIR,
     DEFAULT_GRACE_HOURS,
@@ -97,6 +109,15 @@ __all__ = [
     "CursorStore",
     # 설치본 신원 (sender 기본값)
     "installation_id",
+    # git 이 아는 사람 신원 (설치본이 아니라 **사람** 단위 키가 필요한 소비자용)
+    "git_email",
+    # 참가자별 가변 상태 (예약 경로 — 레코드가 아니다)
+    "ParticipantState",
+    "StateDecodeError",
+    "STATE_DIR",
+    "STATE_VERSION",
+    "state_key",
+    "state_path",
     # 위치 규약
     "gitwire_home",
     "channel_dir",
