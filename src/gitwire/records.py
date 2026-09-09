@@ -55,6 +55,15 @@ MAX_SENDER_LEN = 40
 _SENDER_SAFE = re.compile(r"[^A-Za-z0-9_.@+]+")
 _TS_RE = re.compile(r"^(\d{8}T\d{9}Z)-")
 
+#: 레코드 id 의 형태. **id 는 곧 파일 경로**이므로(위 「파일 배치」) 이 하나가
+#: 형식의 정본이다. 롤업으로 저장 위치가 `archive/` 안의 한 줄로 옮겨져도 id 는
+#: 바뀌지 않으므로, 아카이브된 레코드도 이 형태를 만족한다.
+#: 난수 접미는 호출자가 넘길 수도 있으므로(`make_record_id(nonce=...)`) 길이를
+#: 못 박지 않는다 — 형태 판정의 힘은 앞의 **고정폭 타임스탬프**에서 나온다.
+_RECORD_ID_RE = re.compile(
+    r"^" + RECORD_DIR + r"/(\d{8})/(\d{8}T\d{9}Z)-[A-Za-z0-9_.@+]+-[A-Za-z0-9]+\.json$"
+)
+
 
 class RecordDecodeError(ValueError):
     """레코드 파일을 봉투로 해석할 수 없다."""
@@ -89,6 +98,28 @@ def make_record_id(
     day = stamp[:8]
     rand = nonce or _secrets.token_hex(3)
     return f"{RECORD_DIR}/{day}/{stamp}-{slug_sender(sender)}-{rand}.json"
+
+
+def is_record_id(value: Any) -> bool:
+    """이 문자열이 **이 채널이 실제로 발행할 수 있는** 레코드 id 인가.
+
+    ⭐ 왜 기반이 이것을 제공하는가 — id 형식의 주인이 여기이기 때문이다. 소비자는
+    이 id 를 **커서**로 쓴다(`cursor.Cursor.watermark`, 참가자 상태의 읽음 커서).
+    커서에 id 가 아닌 값이 들어가면 사전식 비교가 무의미해지고, 그 비교로 만드는
+    모든 파생값(안 읽은 개수·구분선·"이미 준 것" 판정)이 조용히 0/전부로 무너진다.
+    실제로 그렇게 무너졌다 — 소비자가 화면의 낙관적 임시 ID(`~pending/…`)를 커서로
+    저장해 원격까지 올렸고, `~` 가 `records/` 보다 사전식으로 뒤라 **한 번 오염되면
+    실제 id 로 되돌아갈 수도 없었다**(단조 증가가 그 값을 최대값으로 굳힌다).
+
+    그래서 판정을 소비자마다 다시 짜지 않게 **형식의 주인이 내준다.** 값을 고치지
+    않고 참/거짓만 돌려준다 — 무엇을 할지(거부·무시)는 소비자가 정한다.
+    """
+    if not isinstance(value, str):
+        return False
+    m = _RECORD_ID_RE.match(value)
+    # 날짜 디렉토리는 타임스탬프에서 **파생된** 값이다 (`make_record_id`). 둘이
+    # 어긋난 경로는 이 채널이 만든 것이 아니다.
+    return m is not None and m.group(1) == m.group(2)[:8]
 
 
 @dataclass(frozen=True)
