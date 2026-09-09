@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from gitwire import clock, credentials, gitcmd, identity, layout, records
+from gitwire import clock, credentials, gitcmd, identity, layout, records, rollup
 from gitwire.treecache import TreeCache
 from gitwire.cursor import Cursor, CursorStore
 from gitwire.errors import AuthError, GitError, PushRejected
@@ -39,6 +39,46 @@ def test_record_id_is_one_file_per_record():
     made = {records.make_record_id(t, "alice") for _ in range(200)}
     assert len(made) == 200
     assert all(m.startswith("records/20260903/") for m in made)
+
+
+def test_is_record_id_accepts_what_this_channel_makes():
+    """⭐ 형식 판정의 정본이 여기다 — 만든 것을 그대로 받아들여야 한다."""
+    t = datetime(2026, 9, 3, 10, 0, 0, 123000, tzinfo=timezone.utc)
+    for sender in ("alice", "yh.choi@interxlab.com.c587c2", "alice+tag"):
+        assert records.is_record_id(records.make_record_id(t, sender))
+    # 롤업으로 저장 위치가 archive/ 로 옮겨져도 id 는 안 바뀐다 → 그대로 참이다.
+    assert records.is_record_id(records.make_record_id(t, "alice", "abc123"))
+
+
+def test_is_record_id_rejects_anything_that_is_not_one():
+    """⭐ 커서에 id 아닌 값이 들어가는 문을 여기서 닫는다.
+
+    실측된 사고: 소비자가 화면의 낙관적 임시 ID(`~pending/…`)를 읽음 커서로
+    저장해 원격까지 올렸다. `~` 가 `records/` 보다 사전식으로 **뒤**라 그 값이
+    항상 최대값이 되고, 커서가 단조 증가라 실제 id 로 되돌아갈 수 없었다.
+    """
+    for bad in (
+        "~pending/000001",                      # ⭐ 실제로 저장돼 있던 값
+        "", None, 123, "records/", "?",
+        "archive/20260903.jsonl",                # 아카이브 **파일**은 id 가 아니다
+        "participants/alice@x.io.json",          # 예약 경로도 아니다
+        "records/20260903/notatimestamp-a-abc123.json",
+        "records/20260904/20260903T100000123Z-a-abc123.json",  # 날짜 칸이 어긋난다
+        "records/20260903/20260903T100000123Z-a-abc123.txt",
+        "records/20260903/sub/20260903T100000123Z-a-abc123.json",
+    ):
+        assert not records.is_record_id(bad), bad
+
+
+def test_rollup_line_id_uses_the_same_judgement():
+    """롤업의 id 추출이 형식 판정을 손으로 다시 세지 않는다 (두 곳이 어긋나지 않게)."""
+    t = datetime(2026, 9, 3, 10, 0, 0, 123000, tzinfo=timezone.utc)
+    rid = records.make_record_id(t, "alice", "abc123")
+    line = records.encode(rid, "alice", t, {"x": 1}).decode("utf-8").strip()
+    assert rollup.line_id(line) == rid
+    # 빠른 정규식 경로가 형식을 만족하지 않는 값을 **id 로 채택하지 않는다** —
+    # 그 판단이 `is_record_id` 하나에서 나온다는 것이 이 검증의 요지다.
+    assert not records.is_record_id("~pending/000001")
 
 
 def test_sender_slug_is_filename_safe():

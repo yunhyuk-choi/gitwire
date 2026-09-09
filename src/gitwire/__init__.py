@@ -64,7 +64,7 @@ from .gitcmd import GitRunner, SubprocessGitRunner
 from .hub import Hub
 from .identity import git_email, installation_id
 from .layout import channel_dir, gitwire_home, normalize_repo_url
-from .records import Record
+from .records import Record, is_record_id
 from .state import (
     STATE_DIR,
     STATE_VERSION,
@@ -92,6 +92,8 @@ __all__ = [
     "Hub",
     "Record",
     "HistoryPage",
+    # 레코드 id 형식 판정 (커서에 id 아닌 값이 들어가는 것을 막는 문)
+    "is_record_id",
     # 자격증명
     "Credential",
     "NoCredential",

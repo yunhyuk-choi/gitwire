@@ -55,6 +55,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from . import records
 from .errors import GitwireError
 
 #: 아카이브 파일이 사는 곳. `records/` 밖에 두는 이유 —
@@ -201,7 +202,9 @@ def line_id(line: str) -> str | None:
     m = _ID_RE.search(line)
     if m:
         rid = m.group(1)
-        if rid.startswith("records/") and rid.endswith(".json"):
+        # 형식 판정은 id 의 주인이 한다 (`records.is_record_id`) — 여기서 접두·
+        # 접미를 손으로 다시 세면 두 곳이 어긋난다.
+        if records.is_record_id(rid):
             return rid
     try:
         obj = json.loads(line)
