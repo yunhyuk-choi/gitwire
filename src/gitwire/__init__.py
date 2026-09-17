@@ -42,7 +42,7 @@ from .channel import (
     DEFAULT_CREDENTIAL_CACHE_TIMEOUT,
     DEFAULT_PAGE,
     DEFAULT_POLL_INTERVAL,
-    DEFAULT_ROLLUP_INTERVAL,
+    DEFAULT_ARCHIVE_INTERVAL,
     Channel,
     HistoryPage,
     PendingRecord,
@@ -79,9 +79,12 @@ from .state import (
 from .rollup import (
     ARCHIVE_DIR,
     DEFAULT_GRACE_HOURS,
-    DEFAULT_MIN_RECORDS,
     ArchiveFormatError,
     archive_path,
+    is_day,
+    last_closed_day,
+    previous_day,
+    today_utc,
 )
 
 __version__ = "0.2.0"
@@ -141,9 +144,12 @@ __all__ = [
     # 지난 날짜 롤업 (비파괴 — compact 와 다르다)
     "ARCHIVE_DIR",
     "archive_path",
+    "is_day",
+    "last_closed_day",
+    "previous_day",
+    "today_utc",
     "DEFAULT_GRACE_HOURS",
-    "DEFAULT_MIN_RECORDS",
-    "DEFAULT_ROLLUP_INTERVAL",
+    "DEFAULT_ARCHIVE_INTERVAL",
     # 기본값
     "DEFAULT_BRANCH",
     "DEFAULT_POLL_INTERVAL",

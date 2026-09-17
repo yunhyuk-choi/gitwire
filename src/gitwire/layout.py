@@ -34,10 +34,14 @@
 ------------------------
     gitwire.json        채널 메타 (포맷 버전)
     records/<날짜>/*.json       append-only 레코드 (사건)
-    archive/<날짜>.jsonl        지난 날짜 롤업 (rollup.py — 레코드를 옮긴 것)
     participants/<키>.json      참가자별 **가변** 상태 (state.py — 레코드가 아니다)
     .gitattributes      모든 파일 바이트 보존 (CRLF 변환 금지)
+    .gitignore          `archive/` 를 전원이 무시하게 만드는 한 줄 (추적된다)
     README.md           레포를 직접 열어본 사람을 위한 안내
+
+⚠️ **`archive/<날짜>.jsonl` 은 위 목록에 없다 — 추적되지 않는다.** 지난 날짜
+아카이브는 각자의 작업 사본에만 있는 **로컬 파일**이고, `.gitignore` 가 그것을
+강제한다. 근거(같은 데이터를 두 벌 저장하던 실측)는 `rollup.py` 상단에 있다.
 """
 
 from __future__ import annotations
@@ -50,6 +54,8 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from . import rollup as _rollup
+
 CHANNEL_META = "gitwire.json"
 CHANNEL_FORMAT = 1
 _SLUG_RE = re.compile(r"[^a-z0-9_.-]+")
@@ -59,8 +65,10 @@ _REPO_README = """# gitwire 채널 레포
 이 레포는 [gitwire](https://github.com/yunhyuk-choi/gitwire) 가 **전송 계층**으로 쓰는
 저장소다. 사람이 직접 편집하지 않는다.
 
-* `records/<날짜>/*.json` — append-only 레코드. 한 건 = 한 파일. 수정·삭제하지 않는다.
+* `records/<날짜>/*.json` — append-only 레코드. 한 건 = 한 파일. 수정하지 않는다.
+  지난 날짜는 **전원이 로컬 아카이브로 옮겼다고 확인응답한 뒤에** 삭제된다.
 * `archive/<날짜>.jsonl` — 지난 날짜의 레코드를 하루 1파일로 접은 것 (한 줄 = 한 건).
+  ⚠️ **이 디렉토리는 추적되지 않는다 (`.gitignore`)** — 각자 자기 컴퓨터에만 있다.
   레코드를 버리지 않는다 — 저장 위치만 옮기고 id 는 그대로다.
 * `participants/<키>.json` — 참가자별 **가변** 상태. 레코드가 아니다(덮어쓴다).
   **한 파일의 쓰기자는 그 참가자 한 명**이고, 그 성질이 동시 갱신의 안전성 근거다.
@@ -150,6 +158,7 @@ def repo_skeleton(channel_name: str | None, created_at: str) -> dict[str, bytes]
         ).encode("utf-8"),
         "README.md": _REPO_README.encode("utf-8"),
         ".gitattributes": _REPO_GITATTRIBUTES.encode("utf-8"),
+        ".gitignore": _rollup.ARCHIVE_GITIGNORE.encode("utf-8"),
         "records/.gitkeep": b"",
         # 참가자 상태 예약 경로 (`state.py`). 빈 채널에도 심어 둔다 — 레포를
         # 열어본 사람이 이 경로가 규약임을 바로 알 수 있고, 커밋 대상 pathspec

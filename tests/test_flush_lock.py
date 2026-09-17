@@ -42,7 +42,7 @@ def landed(bare_repo, homes, name="verify") -> list[str]:
     """원격에 **정말** 올라간 레코드 id (별도 클론으로 확인한다)."""
     ch = gitwire.Channel(
         str(bare_repo), home=homes(name), sender=name, consumer=name,
-        clock=FixedOffsetClock(0.0), auto_rollup=False,
+        clock=FixedOffsetClock(0.0), auto_archive=False,
     ).open()
     try:
         return [r.id for r in ch.history(fresh=True)]
@@ -214,9 +214,9 @@ def test_sync_does_not_interleave_with_a_running_push(participant, bare_repo, ho
     assert len(got) == len(set(got))
 
 
-def test_rollup_overlapping_with_flush_loses_nothing(participant, bare_repo, homes):
-    """롤업(로컬을 크게 바꾼다)과 발행·flush 가 겹쳐도 유실·중복이 없다."""
-    from test_rollup import write_past   # noqa: PLC0415
+def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes):
+    """아카이빙·삭제(로컬을 크게 바꾼다)와 발행·flush 가 겹쳐도 유실·중복이 없다."""
+    from test_archive import write_past   # noqa: PLC0415
 
     a = participant("a", batch_window=3600.0)
     old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(6)])
@@ -239,24 +239,26 @@ def test_rollup_overlapping_with_flush_loses_nothing(participant, bare_repo, hom
 
     th = threading.Thread(target=writer, daemon=True)
     th.start()
-    res = a.rollup()
+    arch = a.archive_days()
+    res = a.drop_days(arch["archived"])
     stop.set()
     th.join(30)
     a.flush()
 
     assert not err, err
-    # 롤업이 이번에 졌을 수도 있다(발행이 계속 원격을 움직인다). 그것 자체는
-    # 정상이다 — 유실이 없고, 조용해지면 다음 시도가 접는다.
-    if not res["rolled"]:
+    # 삭제가 이번에 졌을 수도 있다(발행이 계속 원격을 움직인다). 그것 자체는
+    # 정상이다 — 유실이 없고, 조용해지면 다음 시도가 지운다.
+    if not res["dropped"]:
         assert res["reason"].startswith("push 경합"), res
-        res = a.rollup()
-    assert res["rolled"] is True, res
+        a.archive_days()
+        res = a.drop_days(arch["archived"])
+    assert res["dropped"] is True, res
     got = landed(bare_repo, homes)
     assert sorted(got) == sorted(r.id for r in made), (
         set(r.id for r in made) - set(got)
     )
     assert len(got) == len(set(got))
-    # 롤업된 날짜도 그대로 읽힌다
+    # 아카이빙된 날짜도 그대로 읽힌다
     assert {r.id for r in a.history(fresh=True)} == {r.id for r in made}
 
 

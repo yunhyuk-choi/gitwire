@@ -69,7 +69,7 @@ class CountingRunner(SubprocessGitRunner):
 def _open(bare_repo, home, sender, runner=None, **extra):
     kwargs = dict(
         home=home, sender=sender, clock=FixedOffsetClock(0.0), batch_window=0.0,
-        auto_rollup=False,
+        auto_archive=False,
     )
     kwargs.update(extra)
     if runner is not None:
@@ -192,20 +192,20 @@ def test_new_records_still_arrive_after_idle_polls(bare_repo, homes):
         writer.close()
 
 
-def test_rollup_check_in_the_idle_path_costs_no_git(bare_repo, homes):
-    """롤업 후보 확인(`maybe_rollup`)도 유휴 폴에 git 을 더하지 않는다.
+def test_archive_check_in_the_idle_path_costs_no_git(bare_repo, homes):
+    """아카이빙 후보 확인(`maybe_archive`)도 유휴 폴에 git 을 더하지 않는다.
 
-    폴링마다 보게 강제(`rollup_interval=0`)하고, 접을 수 있는 지난 날짜가 없는
+    폴링마다 보게 강제(`archive_interval=0`)하고, 옮길 수 있는 지난 날짜가 없는
     상태(레코드가 오늘 날짜)로 둔다 — 확인 비용이 **캐시된 나열 1회 = git 0개**
     임을 못 박는다. (실제 기본값은 1시간마다 한 번 본다.)
     """
     today = datetime.now(timezone.utc)
-    writer = _open(bare_repo, homes("w"), "alice", auto_rollup=False)
+    writer = _open(bare_repo, homes("w"), "alice", auto_archive=False)
     _fill(writer, 3, start=today, step=timedelta(seconds=1))
     runner = CountingRunner()
     reader = _open(
         bare_repo, homes("r"), "bob", runner,
-        auto_rollup=True, rollup_interval=0.0,
+        auto_archive=True, archive_interval=0.0,
     )
     try:
         reader.skip_to_now()
@@ -214,7 +214,7 @@ def test_rollup_check_in_the_idle_path_costs_no_git(bare_repo, homes):
             runner.reset()
             assert reader.poll_once(lambda r: None) == 0
             assert runner.calls == ["ls-remote"], runner.calls
-        assert reader.rollup_last_error is None
+        assert reader.archive_last_error is None
     finally:
         reader.close()
         writer.close()
@@ -312,8 +312,8 @@ def test_packed_refs_change_is_noticed(bare_repo, homes):
 # --------------------------------------- I-5. 롤업 · compact 뒤에도 정합
 
 
-def test_rollup_then_reads_stay_consistent(bare_repo, homes):
-    """롤업(비파괴)은 로컬 HEAD 를 움직인다 — 캐시가 따라와야 한다."""
+def test_drop_then_reads_stay_consistent(bare_repo, homes):
+    """레코드 삭제(비파괴)는 로컬 HEAD 를 움직인다 — 캐시가 따라와야 한다."""
     writer = _open(bare_repo, homes("w"), "alice")
     _fill(writer, 6, start=datetime(2026, 8, 1, tzinfo=timezone.utc),
           step=timedelta(hours=1))
@@ -323,11 +323,19 @@ def test_rollup_then_reads_stay_consistent(bare_repo, homes):
         before_head = reader._head()
         ids_before = reader.record_ids(fresh=False)
 
-        res = writer.rollup(force=True, min_records=1)
-        assert res["rolled"] is True, res
+        arch = writer.archive_days(force=True)
+        assert arch["archived"], arch
+        res = writer.drop_days(arch["archived"], force=True)
+        assert res["dropped"] is True, res
 
         reader.sync()
-        assert reader._head() != before_head, "롤업 커밋을 못 봤다"
+        assert reader._head() != before_head, "삭제 커밋을 못 봤다"
+        # ⚠️ reader 는 그 날짜를 옮기지 않았으므로 자기 로컬 아카이브가 없다 —
+        # 삭제를 pull 로 받으면 히스토리에서 복구하는 것이 규약이다 (소비자가
+        # 그 순간을 안다: `deleted_days`). 복구 전/후를 함께 못 박는다.
+        for day in arch["archived"]:
+            got = reader.recover_archive(day)
+            assert not got["problems"], got
         assert reader.record_ids(fresh=False) == ids_before, "레코드가 사라졌다"
         assert [r.id for r in reader.history(fresh=False)] == ids_before
     finally:

@@ -273,7 +273,7 @@ def test_queue_is_memory_only_and_dies_with_the_process(
 
     reborn = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="a",
-        clock=gitwire.FixedOffsetClock(0.0), batch_window=3600.0, auto_rollup=False,
+        clock=gitwire.FixedOffsetClock(0.0), batch_window=3600.0, auto_archive=False,
     ).open()
     try:
         assert reborn.flush() == []               # 밀어낼 것이 없다

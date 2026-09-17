@@ -259,17 +259,53 @@ def cmd_compact(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def cmd_rollup(args: argparse.Namespace) -> int:
-    """지난 날짜 롤업 (비파괴). `compact` 와 다른 물건이다 — force-push 없음."""
+def cmd_archive(args: argparse.Namespace) -> int:
+    """지난 날짜를 **로컬** 아카이브 파일로 옮긴다 (커밋·push 없음).
+
+    `--drop` 을 주면 옮긴 날짜의 레코드 삭제까지 커밋·push 한다.
+
+    ⚠️ **`--drop` 은 합의를 확인하지 않는다.** 전원이 그 날짜를 옮겼는지 판정하는
+    것은 소비자 애플리케이션의 일이다(참가자 상태 파일 안의 소비자 스키마다 —
+    `state.py`). 이 플래그는 *소비자가 없는 단일 참가자 방*과 진단용이다.
+    기반이 지키는 것은 "내가 담지 않은 레코드는 지우지 않는다" + fast-forward
+    뿐이다 (`Channel.drop_days`).
+    """
     with _channel(args) as ch:
-        result = ch.rollup(
+        result = ch.archive_days(
             grace_hours=args.grace_hours,
-            min_records=args.min_records,
             days=args.day or None,
             force=args.force,
         )
-        _emit({"ok": True, "command": "rollup", **result})
+        out = {"ok": True, "command": "archive", **result}
+        if args.drop and result["archived"]:
+            out["drop"] = ch.drop_days(
+                result["archived"], grace_hours=args.grace_hours, force=args.force
+            )
+        _emit(out)
     return EXIT_OK
+
+
+def cmd_recover_archive(args: argparse.Namespace) -> int:
+    """지워진 날짜의 레코드를 히스토리에서 꺼내 로컬 아카이브에 채운다."""
+    with _channel(args) as ch:
+        days = args.day or ch.archive_gaps(
+            args.through or gitwire_today(ch), max_days=args.max_days
+        )
+        out = [ch.recover_archive(day) for day in days]
+        _emit({
+            "ok": True, "command": "recover-archive",
+            "checked": list(days),
+            "recovered": [r for r in out if r["recovered"]],
+            "problems": {r["day"]: r["problems"] for r in out if r["problems"]},
+        })
+    return EXIT_OK
+
+
+def gitwire_today(ch: Channel) -> str:
+    """이 채널의 공통 시계 기준 **UTC** 오늘 (`YYYYMMDD`)."""
+    from . import rollup as _rollup
+
+    return _rollup.today_utc(ch.clock.now())
 
 
 def cmd_where(args: argparse.Namespace) -> int:
@@ -378,8 +414,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_compact)
 
     sp = sub.add_parser(
-        "rollup",
-        help="지난 날짜의 레코드를 하루 1파일로 접는다 (비파괴 — compact 와 다르다)",
+        "archive",
+        help="지난 날짜를 로컬 아카이브 파일로 옮긴다 (커밋 없음 — compact 와 다르다)",
     )
     common(sp)
     sp.add_argument(
@@ -387,18 +423,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="UTC 자정 이후 이만큼 지나야 '지난 날'로 본다 (기본 2)",
     )
     sp.add_argument(
-        "--min-records", type=int, default=None,
-        help="이 미만이면 접지 않는다 (기본 2)",
-    )
-    sp.add_argument(
         "--day", action="append", default=None,
-        help="이 날짜만 접는다 (YYYYMMDD, 반복 가능)",
+        help="이 날짜만 옮긴다 (YYYYMMDD, 반복 가능)",
     )
     sp.add_argument(
         "--force", action="store_true",
-        help="'지난 날' 판정을 무시하고 접는다 (--day 와 함께 쓴다)",
+        help="'지난 날' 판정을 무시하고 옮긴다 (--day 와 함께 쓴다)",
     )
-    sp.set_defaults(func=cmd_rollup)
+    sp.add_argument(
+        "--drop", action="store_true",
+        help="옮긴 날짜의 레코드 삭제까지 커밋·push 한다 (합의 판정은 소비자 몫이다)",
+    )
+    sp.set_defaults(func=cmd_archive)
+
+    sp = sub.add_parser(
+        "recover-archive",
+        help="지워진 날짜의 레코드를 히스토리에서 꺼내 로컬 아카이브를 복구한다",
+    )
+    common(sp)
+    sp.add_argument(
+        "--day", action="append", default=None,
+        help="이 날짜만 복구한다 (YYYYMMDD, 반복 가능). 없으면 빈 날짜를 찾아 훑는다",
+    )
+    sp.add_argument(
+        "--through", default=None,
+        help="여기서부터 거슬러 올라가며 훑는다 (YYYYMMDD, 기본 오늘)",
+    )
+    sp.add_argument(
+        "--max-days", type=int, default=60,
+        help="거슬러 올라갈 날짜 수 상한 (기본 60)",
+    )
+    sp.set_defaults(func=cmd_recover_archive)
 
     sp = sub.add_parser("where", help="로컬 클론·커서 경로 출력 (네트워크 없음)")
     sp.add_argument("--repo", required=True)

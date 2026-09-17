@@ -150,7 +150,7 @@ def test_있음_판정은_git_을_부르지_않는다(bare_repo, homes):
     runner = CountingRunner()
     ch = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="alice", runner=runner,
-        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_rollup=False,
+        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
     ).open()
     try:
         runner.reset()
@@ -302,7 +302,7 @@ def test_한_사람_두_기기가_같은_경로를_써도_push_가_깨지지_않
     def open_device(name: str):
         return gitwire.Channel(
             str(bare_repo), home=homes(name), sender=name,
-            clock=FixedOffsetClock(0.0), batch_window=0.0, auto_rollup=False,
+            clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
         ).open()
 
     laptop = open_device("laptop")
@@ -356,15 +356,20 @@ def test_롤업이_상태를_건드리지_않는다(bare_repo, participant):
     alice.clock = FixedOffsetClock(0.0)
     alice.write_state("alice@x.io", {"cursor": ids[-1]}, flush=True)
 
-    res = alice.rollup(force=True, min_records=1)
-    assert res["rolled"] is True, res
+    arch = alice.archive_days(force=True)
+    assert arch["archived"], arch
+    res = alice.drop_days(arch["archived"], force=True)
+    assert res["dropped"] is True, res
 
     files = _remote_files(bare_repo)
     assert "participants/alice@x.io.json" in files, files
-    assert any(f.startswith("archive/") for f in files), files
-    # 아카이브 안에 상태가 섞이지 않았다.
-    arch = _git_bare(bare_repo, "show", f"HEAD:{[f for f in files if f.startswith('archive/')][0]}")
-    assert "gitwire_state" not in arch
+    # ⭐ 아카이브는 **추적되지 않는다** — 원격에 올라가지 않는다.
+    assert not [f for f in files if f.startswith("archive/")], files
+    # 로컬 아카이브 안에 참가자 상태가 섞이지 않았다.
+    local = (alice.clone_dir / gitwire.archive_path(arch["archived"][0])).read_text(
+        encoding="utf-8"
+    )
+    assert "gitwire_state" not in local
     # 그리고 값은 그대로 읽힌다.
     alice.sync()
     assert alice.read_state("alice@x.io").value == {"cursor": ids[-1]}
@@ -415,7 +420,7 @@ def test_같은_커밋을_되풀이해_읽으면_git_을_부르지_않는다(bar
     runner = CountingRunner()
     reader = gitwire.Channel(
         str(bare_repo), home=homes("r"), sender="bob", runner=runner,
-        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_rollup=False,
+        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
     ).open()
     try:
         reader.sync()
