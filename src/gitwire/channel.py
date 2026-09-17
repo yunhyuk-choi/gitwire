@@ -29,6 +29,7 @@ from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
 from .errors import (
     ChannelInitError,
     GitError,
+    GitwireError,
     HistoryRewritten,
     NotPushed,
     PushRejected,
@@ -58,8 +59,8 @@ PUSHED_REF = "refs/gitwire/pushed"
 #:
 #: ⭐ **레코드는 여기 걸리지 않는다** — 한 레코드 = 한 파일이고 파일명이
 #: `<밀리초 타임스탬프>-<발신자>-<난수6>` 이라 두 참가자가 같은 경로를 만드는 일이
-#: 사실상 없다. 지난 날짜 롤업도 자기 커밋을 fast-forward 로만 올리므로(`rollup()`)
-#: 이 경로를 타지 않는다.
+#: 사실상 없다. 아카이브된 날짜의 레코드 삭제도 자기 커밋을 fast-forward 로만
+#: 올리므로(`drop_days()`) 이 경로를 타지 않는다.
 #:
 #: 실제로 같은 경로가 겹칠 수 있는 것은 **참가자 상태 예약 경로 하나**이고
 #: (`state.py` — 한 사람이 노트북·데스크탑을 함께 쓰면 같은 파일이다),
@@ -83,10 +84,10 @@ _MS = timedelta(milliseconds=1)
 #: 자격증명 메모리 캐시의 기본 수명(초). `credential_cache()` 참조.
 DEFAULT_CREDENTIAL_CACHE_TIMEOUT = 900.0
 
-#: 롤업 후보를 다시 살펴보는 최소 간격(초). 근거는 `maybe_rollup()`.
-DEFAULT_ROLLUP_INTERVAL = 3600.0
-#: 한 번의 롤업에서 push 경합에 양보하고 다시 계산해 볼 횟수.
-DEFAULT_ROLLUP_ATTEMPTS = 4
+#: 아카이빙 후보를 다시 살펴보는 최소 간격(초). 근거는 `maybe_archive()`.
+DEFAULT_ARCHIVE_INTERVAL = 3600.0
+#: 한 번의 레코드 삭제에서 push 경합에 양보하고 다시 계산해 볼 횟수.
+DEFAULT_DROP_ATTEMPTS = 4
 
 #: "빈 레포" 로 쳐 주는 파일들. forge 가 새 레포를 만들 때 넣어 주는 것들이라
 #: 이게 있다고 해서 "쓰고 있는 레포"는 아니다.
@@ -305,10 +306,9 @@ class Channel:
         author_name: str = "gitwire",
         author_email: str = "gitwire@localhost",
         clock_refresh_interval: float = _clock.DEFAULT_REFRESH_INTERVAL,
-        auto_rollup: bool | None = None,
-        rollup_grace_hours: float = _rollup.DEFAULT_GRACE_HOURS,
-        rollup_min_records: int = _rollup.DEFAULT_MIN_RECORDS,
-        rollup_interval: float = DEFAULT_ROLLUP_INTERVAL,
+        auto_archive: bool | None = None,
+        archive_grace_hours: float = _rollup.DEFAULT_GRACE_HOURS,
+        archive_interval: float = DEFAULT_ARCHIVE_INTERVAL,
     ) -> None:
         self.repo_url = repo_url
         self.branch = branch
@@ -328,22 +328,24 @@ class Channel:
         self.depth = depth
         self.author_name = author_name
         self.author_email = author_email
-        # 지난 날짜 롤업 (rollup.py). 기본은 **켜짐** — 파일 개수가 아프기 시작하는
-        # 규모는 활발한 방이면 며칠이면 닿는데(README 실측표), 손으로 부르게 해
-        # 두면 아무도 부르지 않는다. 끄려면 auto_rollup=False 또는 환경변수
-        # GITWIRE_AUTO_ROLLUP=0.
-        self.auto_rollup = (
-            os.environ.get("GITWIRE_AUTO_ROLLUP", "1").strip().lower()
+        # 지난 날짜 아카이빙 (rollup.py). 기본은 **켜짐** — 로컬 파일을 쓰는
+        # 일뿐이라(커밋·push·네트워크 0) 켜 두어 잃는 것이 없고, 소비자의 일일
+        # 배치가 멈춰 있어도 로컬 아카이브가 만들어져 있다. 끄려면
+        # auto_archive=False 또는 환경변수 GITWIRE_AUTO_ARCHIVE=0.
+        #
+        # ⚠️ **레코드 삭제는 여기에 들어 있지 않다.** 삭제는 전원 확인응답 뒤에
+        # 소비자가 `drop_days()` 로 시킬 때만 일어난다 (rollup.py 상단).
+        self.auto_archive = (
+            os.environ.get("GITWIRE_AUTO_ARCHIVE", "1").strip().lower()
             not in ("0", "false", "no", "off")
-            if auto_rollup is None
-            else bool(auto_rollup)
+            if auto_archive is None
+            else bool(auto_archive)
         )
-        self.rollup_grace_hours = float(rollup_grace_hours)
-        self.rollup_min_records = max(1, int(rollup_min_records))
-        self.rollup_interval = float(rollup_interval)
-        self.rollup_last_error: str | None = None
-        self._rollup_thread: threading.Thread | None = None
-        self._rollup_checked: float | None = None
+        self.archive_grace_hours = float(archive_grace_hours)
+        self.archive_interval = float(archive_interval)
+        self.archive_last_error: str | None = None
+        self._archive_thread: threading.Thread | None = None
+        self._archive_checked: float | None = None
 
         self.home = Path(home) if home is not None else layout.gitwire_home()
         self.dir = layout.channel_dir(repo_url, self.home)
@@ -406,9 +408,13 @@ class Channel:
         # 나열 결과 캐시. 키가 sha(내용 주소)라 stale 이 정의상 불가능하다 —
         # 근거와 크기 제한은 treecache.py 참조.
         self._trees = TreeCache()
-        # 마지막으로 연 아카이브 한 개 (sha, {id: 줄}). 페이징은 보통 같은
+        # 마지막으로 연 아카이브 한 개 (스탬프, {id: 줄}). 페이징은 보통 같은
         # 날짜를 연달아 읽으므로 이 한 칸이 거의 전부를 흡수한다.
         self._archive_memo: tuple[str | None, dict[str, str]] = (None, {})
+        # 날짜별로 **마지막으로 아카이빙한 라이브 트리 sha**. 합의를 기다리는 동안
+        # 같은 날짜를 되풀이해 옮기지 않기 위한 것뿐이다 (`_archive_candidates`).
+        # 메모리에만 둔다 — 잃어도 다음 한 번이 멱등하게 같은 바이트를 만든다.
+        self._archived_tree: dict[str, str] = {}
 
         if clock is not None:
             self.clock = clock
@@ -630,6 +636,7 @@ class Channel:
         self._fetch(quiet=True)
         self._integrate()
         if (self.clone_dir / layout.CHANNEL_META).exists():
+            self._ensure_archive_ignored()
             return
         self._refuse_if_repo_has_content()
         created = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -641,6 +648,7 @@ class Channel:
         g = self.git
         g.run("add", "-A", "--", ".")
         if g.run("diff", "--cached", "--quiet", check=False).returncode == 0:
+            self._ensure_archive_ignored()
             return
         g.run("commit", "-m", "gitwire: 채널 초기화")
         try:
@@ -654,6 +662,69 @@ class Channel:
             g.run("reset", "--hard", remote)
         if not (self.clone_dir / layout.CHANNEL_META).exists():
             raise ChannelInitError("채널 레이아웃 확정 실패")
+        # ⚠️ 초기화 경로에서도 확인한다. 스켈레톤은 **없는 파일만** 심으므로
+        # (forge 가 만들어 준 `.gitignore` 가 이미 있으면 건드리지 않는다) 여기
+        # 오는 레포가 `archive/` 규칙을 갖고 있다는 보장이 없다. 위 경쟁에서 진
+        # 경우도 남의 초기화를 따라온 상태라 같은 확인이 필요하다.
+        self._ensure_archive_ignored()
+
+    def _ensure_archive_ignored(self) -> None:
+        """이미 쓰고 있는 채널에도 `archive/` 무시 규칙을 **한 번** 심는다.
+
+        ⭐ 왜 필요한가: `.gitignore` 없이 로컬 아카이브 파일을 만들면, `add -A` 로
+        도는 경로(`compact()`·사람이 직접 하는 `git add`)가 그것을 커밋에 실어
+        버린다. 그러면 "아카이브는 로컬 전용"이라는 이 설계의 전제가 조용히
+        깨지고, 고치려던 이중 저장이 되돌아온다.
+
+        ⚠️ **이미 추적되고 있는 아카이브 파일을 지우지 않는다.** gitignore 는
+        추적 중인 파일에 영향이 없고, 그것을 정리하는 것(`git rm --cached`)은
+        사람의 결정이다 — 우리가 남의 레포에서 파일을 지우지 않는다. 여기서 사는
+        것은 **새로 만들어지는** 아카이브가 처음부터 추적되지 않는 성질뿐이다.
+        """
+        path = self.clone_dir / ".gitignore"
+        try:
+            text = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+        except OSError as exc:
+            log.warning("gitwire: .gitignore 를 읽지 못했다: %s", exc)
+            return
+        lines = [ln.strip() for ln in text.splitlines()]
+        if _rollup.ARCHIVE_IGNORE_LINE in lines or _rollup.ARCHIVE_DIR in lines:
+            return
+        if not text:
+            new = _rollup.ARCHIVE_GITIGNORE
+        else:
+            tail = "" if text.endswith("\n") else "\n"
+            new = (
+                text + tail + "\n# 지난 날짜 아카이브는 **로컬 전용**이다 "
+                "(추적하면 같은 데이터가 두 벌 저장된다).\n"
+                + _rollup.ARCHIVE_IGNORE_LINE + "\n"
+            )
+        try:
+            path.write_bytes(new.encode("utf-8"))
+        except OSError as exc:
+            log.warning("gitwire: .gitignore 를 쓰지 못했다: %s", exc)
+            return
+        g = self.git
+        g.run("add", "--", ".gitignore", check=False)
+        if g.run("diff", "--cached", "--quiet", "--", ".gitignore",
+                 check=False).returncode == 0:
+            return
+        # ⚠️ pathspec 을 준다 — 이 커밋에 **다른 것**이 실리지 않게 (인덱스에
+        # 남아 있던 무언가가 함께 나가면 발행 경로의 건수·메시지가 어긋난다).
+        g.run(
+            "commit", "-m", "gitwire: archive/ 는 로컬 전용 (.gitignore)",
+            "--", ".gitignore",
+        )
+        try:
+            self._push()
+        except GitwireError as exc:
+            # 남이 먼저 심었거나, 원격이 움직였거나, **쓰기 권한이 없다**
+            # (읽기 전용 참가자). 어느 쪽이든 여기서 대화를 막을 이유가 없다 —
+            # 이 커밋은 편의이고, 이 클론에서는 이미 무시가 적용된다.
+            # ⚠️ `GitwireError` 로 넓게 받는다: `AuthError` 는 `GitError` 의
+            # 하위가 아니라서 좁게 받으면 토큰 없는 참가자의 `open()` 이 통째로
+            # 실패한다.
+            log.info("gitwire: .gitignore push 를 미룬다 (%s)", exc)
 
     # ------------------------------------------------------- 변경 감지 / 동기
 
@@ -1318,7 +1389,7 @@ class Channel:
         who = _state.state_key(key)
         rel = _state.state_path(who)
         # ⚠️ 시계는 락 **밖에서** 본다 (`HttpDateClock.now()` 는 네트워크 왕복일
-        # 수 있고, 그 순간 읽기·쓰기가 통째로 막힌다 — `maybe_rollup` 과 같은 규율).
+        # 수 있고, 그 순간 읽기·쓰기가 통째로 막힌다 — `maybe_archive` 와 같은 규율).
         ts = self.clock.now()
         data = _state.encode(who, identity if identity is not None else key, value, ts)
         with self._lock:
@@ -1357,21 +1428,21 @@ class Channel:
             return []
         return sorted(p for p in res.stdout.split("\x00") if p.endswith(".json"))
 
-    def _tree_index(self, ref: str) -> tuple[dict[str, str], dict[str, str]]:
-        """(날짜 → 라이브 트리 sha, 날짜 → 아카이브 blob sha).
+    def _live_days(self, ref: str) -> dict[str, str]:
+        """{날짜 → 라이브 트리 sha} — **살아 있는** `records/<날짜>/` 만.
 
-        ⭐ **`ls-tree` 를 한 번만 부른다.** 비재귀 나열에 경로를 두 개 주면
-        (`records/` 와 `archive/`) 한 호출로 둘 다 나온다 — 롤업을 붙이면서 쪽당
-        git 호출이 늘어나면 keyset 페이징으로 얻은 성질을 그대로 잃는다.
-        디렉토리 이름과 그 sha 가 함께 나오므로 sha 를 따로 묻는 왕복도 없다.
-        결과는 커밋 sha 로 캐시한다(같은 커밋 = 같은 트리 = 같은 목록).
+        ⭐ **`ls-tree` 를 한 번만 부른다.** 비재귀 나열이라 디렉토리 이름과 그
+        sha 가 함께 나오므로 sha 를 따로 묻는 왕복이 없다. 결과는 커밋 sha 로
+        캐시한다(같은 커밋 = 같은 트리 = 같은 목록).
+
+        ⚠️ 아카이브는 여기에 없다 — **추적되지 않으므로** git 에게 물을 것이
+        없고, `_archive_days()` 가 로컬 디렉토리를 나열한다 (git 호출 0개).
         """
         key = "days:" + ref
         cached = self._trees.get(key)
         if cached is None:
             res = self.git.run(
-                "ls-tree", "-z", ref, "--",
-                records.RECORD_DIR + "/", _rollup.ARCHIVE_DIR + "/", check=False,
+                "ls-tree", "-z", ref, "--", records.RECORD_DIR + "/", check=False,
             )
             rows = []
             if res.returncode == 0:
@@ -1382,26 +1453,18 @@ class Channel:
                     fields = meta.split()
                     if len(fields) < 3 or not path:
                         continue
-                    # "<sha> <종류(d=라이브 날짜 트리 / a=아카이브)> <날짜>" 한 줄
                     if fields[1] == "tree" and path.startswith(records.RECORD_DIR + "/"):
-                        rows.append(f"{fields[2]} d {path.rsplit('/', 1)[-1]}")
-                    elif fields[1] == "blob" and path.startswith(
-                        _rollup.ARCHIVE_DIR + "/"
-                    ):
-                        day = _rollup.day_from_archive(path)
-                        if day:
-                            rows.append(f"{fields[2]} a {day}")
-            cached = self._trees.put(key, sorted(rows, key=lambda r: r.split(" ", 2)[2]))
+                        rows.append(f"{fields[2]} {path.rsplit('/', 1)[-1]}")
+            cached = self._trees.put(key, sorted(rows, key=lambda r: r.split(" ", 1)[1]))
         live: dict[str, str] = {}
-        arch: dict[str, str] = {}
         for row in cached:
-            sha, kind, day = row.split(" ", 2)
-            (live if kind == "d" else arch)[day] = sha
-        return live, arch
+            sha, day = row.split(" ", 1)
+            live[day] = sha
+        return live
 
     def _day_trees(self, ref: str) -> list[tuple[str, str]]:
         """`records/` 바로 아래 (날짜, 트리 sha) 목록. 오름차순."""
-        return sorted(self._tree_index(ref)[0].items())
+        return sorted(self._live_days(ref).items())
 
     def _day_records(self, day: str, tree: str) -> list[str]:
         """날짜 디렉토리 하나의 레코드 경로 (오름차순 = 시간순).
@@ -1427,11 +1490,15 @@ class Channel:
         prefix = f"{records.RECORD_DIR}/{day}/"
         return [prefix + n for n in names]
 
-    # ------------------------------------------------- 아카이브 (지난 날 롤업)
+    # ------------------------------------- 아카이브 (로컬 전용 — 추적되지 않는다)
 
-    def _archive_index(self, ref: str) -> dict[str, str]:
-        """`archive/` 아래 {날짜: blob sha}. `_tree_index` 와 **같은 나열**을 쓴다."""
-        return self._tree_index(ref)[1]
+    def _archive_days(self) -> dict[str, str]:
+        """{날짜: 스탬프} — **로컬** 아카이브 파일 나열. git 호출 0개.
+
+        날짜가 곧 파일명이므로 예전의 `ls-tree` 조회가 `scandir` 한 번으로
+        대체된다. 스탬프(mtime+크기)는 캐시 열쇠다 (`rollup.stamp_of`).
+        """
+        return _rollup.list_archives(self.clone_dir)
 
     def _blob_bytes(self, sha: str, rel: str) -> bytes:
         """blob 하나의 **검증된** 바이트.
@@ -1461,8 +1528,15 @@ class Channel:
             )
         return got
 
-    def _archive_bytes(self, day: str, sha: str) -> bytes:
-        return self._blob_bytes(sha, _rollup.archive_path(day))
+    def _archive_bytes(self, day: str) -> bytes:
+        """로컬 아카이브 한 날짜의 바이트 (없으면 `b""`).
+
+        ⚠️ `_blob_bytes` 의 sha 대조를 **쓰지 않는다.** 그 대조는 "작업 사본이
+        요청한 버전인지" 확인하는 성능 최적화였고(파일 0.2ms vs git 45ms), 로컬
+        아카이브는 버전이 하나뿐이라 대조할 상대가 없다. 손상 검증이 아니었으므로
+        대체물도 만들지 않는다.
+        """
+        return _rollup.read_archive(self.clone_dir, day)
 
     def _day_blobs(self, day: str, tree: str) -> tuple[list[tuple[str, str]], bool]:
         """그 날짜 트리의 (파일명, blob sha) 목록과 **"깨끗한가"** 판정.
@@ -1488,36 +1562,69 @@ class Channel:
             out.append((name, fields[2]))
         return sorted(out), clean
 
-    def _archive_lines(self, day: str, sha: str) -> dict[str, str]:
-        return _rollup.index_archive(self._archive_bytes(day, sha))
+    def _archive_lines(self, day: str) -> dict[str, str]:
+        """로컬 아카이브 한 날짜의 {id: 줄}. 해석 못 한 줄도 **버리지 않는다**.
 
-    def _archive_ids(self, day: str, sha: str) -> list[str]:
-        """아카이브에 든 레코드 id 목록 (오름차순). blob sha 로 캐시 → 재조회 0회."""
-        key = "aids:" + sha
+        id 를 못 읽은 줄은 합성 키로 남는다 (`rollup.index_archive`) — 다시 쓸 때
+        보존되어야 하므로. 다만 **조용히 넘기지는 않는다**: 그런 줄이 있으면 로그에
+        남긴다. 그 날짜가 이미 지워졌다면 그 줄이 유일한 사본일 수 있다.
+        """
+        lines = _rollup.index_archive(self._archive_bytes(day))
+        bad = [k for k in lines if not records.is_record_id(k)]
+        if bad:
+            log.error(
+                "gitwire: 로컬 아카이브 %s 에 레코드 id 를 읽을 수 없는 줄이 %d개 있다 "
+                "— 보존하되 조회 축에서는 빠진다. recover_archive(%r) 로 히스토리에서 "
+                "다시 채울 수 있다.",
+                day, len(bad), day,
+            )
+        return lines
+
+    def _archive_ids(self, day: str, stamp: str) -> list[str]:
+        """아카이브에 든 레코드 id 목록 (오름차순). 스탬프로 캐시 → 재조회 0회.
+
+        ⚠️ **id 로 읽히는 줄만** 담는다. 조회 축에 정체불명의 키를 올리면 읽기가
+        매번 "없는 레코드"를 찾아 실패한다. 보존은 `_archive_lines` 의 일이다
+        (거기서는 한 줄도 버리지 않는다) — 두 책임을 갈라 둔다.
+        """
+        key = f"aids:{day}:{stamp}"
         ids = self._trees.get(key)
         if ids is None:
-            ids = self._trees.put(key, sorted(self._archive_lines(day, sha)))
+            ids = self._trees.put(
+                key,
+                sorted(k for k in self._archive_lines(day) if records.is_record_id(k)),
+            )
         return ids
 
     def _day_index(self, ref: str) -> list[tuple[str, str | None, str | None]]:
-        """(날짜, 라이브 트리 sha|None, 아카이브 blob sha|None) 오름차순.
+        """(날짜, 라이브 트리 sha|None, 로컬 아카이브 스탬프|None) 오름차순.
 
-        롤업된 날짜와 아직 살아 있는 날짜를 **하나의 날짜 축**으로 합친다. 소비자는
-        어느 쪽인지 알 필요가 없다 (요구: 레거시를 투명하게 가로지른다).
-        전환 중에는 한 날짜에 둘 다 있을 수 있다 — 롤업 뒤에 도착한 레코드다.
+        아카이빙된 날짜와 아직 살아 있는 날짜를 **하나의 날짜 축**으로 합친다.
+        소비자는 어느 쪽인지 알 필요가 없다 (요구: 레거시를 투명하게 가로지른다).
+        **한 날짜에 둘 다 있는 것이 정상 상태다** — 아카이빙(로컬)과 레코드
+        삭제(전원 합의 뒤) 사이의 구간이 그렇다.
         """
-        live, arch = self._tree_index(ref)
+        live = self._live_days(ref)
+        arch = self._archive_days()
         return [(d, live.get(d), arch.get(d)) for d in sorted(set(live) | set(arch))]
 
     def _day_ids(self, day: str, tree: str | None, arch: str | None) -> list[str]:
-        """그 날짜의 레코드 id 전부 (라이브 + 아카이브 합집합, 오름차순·중복 없음)."""
-        if tree and not arch:
-            return self._day_records(day, tree)
-        if arch and not tree:
-            return list(self._archive_ids(day, arch))
-        if tree and arch:
-            return sorted(set(self._day_records(day, tree)) | set(self._archive_ids(day, arch)))
-        return []
+        """그 날짜의 레코드 id 전부 (라이브 ∪ 아카이브, 오름차순·중복 없음).
+
+        ⚠️ **합집합을 계속 쓴다.** 보통은 아카이브 ⊆ 라이브(삭제 전)거나 한쪽만
+        있지만, *시계가 어긋난 **다른** 참가자*는 이미 삭제된 과거 날짜에 레코드를
+        새로 만들 수 있다. 그때 라이브만 보면 아카이브에 든 그 날의 나머지 대화가
+        화면에서 통째로 사라진다 — "데이터를 말없이 버리지 않는다"에 걸린다.
+        비용은 거의 0 이다: 아카이브 id 목록은 스탬프로 캐시되고(파일 파싱은
+        날짜당 한 번), 합집합은 순수 파이썬 집합 연산이다.
+        """
+        live = self._day_records(day, tree) if tree else []
+        if arch is None:
+            return live
+        ids = self._archive_ids(day, arch)
+        if not live:
+            return list(ids)
+        return sorted(set(live) | set(ids))
 
     def _all_ids(self, ref: str) -> list[str]:
         """레코드 id **전량** (아카이브 포함). 전량이 정말 필요한 경로 전용."""
@@ -1582,51 +1689,35 @@ class Channel:
     def _diff_records(self, base: str, target: str) -> list[str]:
         """base..target 사이에 **새로 생긴** 레코드 id (오름차순).
 
-        ⭐ 롤업이 만드는 함정과 그 해소 — 여기가 유실 금지의 핵심이다.
+        ⭐ `git diff base target` 을 쓰지 **않는다** — 여기가 유실 금지의 핵심이다.
 
-        롤업 커밋은 하루치 레코드 **파일을 지우고** 아카이브를 하나 추가한다.
-        그래서 소비자가 오래 쉬었다가 돌아오면(예: 주말 내내 앱을 꺼 둠) 그 사이에
-        *추가됐다가 롤업으로 지워진* 레코드는 `git diff base target` 에 아예
-        나타나지 않는다 — 추가와 삭제가 상쇄되기 때문이다. 그대로 두면 **주말
-        대화가 조용히 사라진다.**
+        레코드 삭제 커밋(전원 확인응답 뒤 그 날짜의 `records/<날짜>/` 를 지우는
+        커밋)이 범위 안에 있으면, *그 사이에 추가됐다가 지워진* 레코드는 **두
+        트리의 차이에 아예 나타나지 않는다** — 추가와 삭제가 상쇄되기 때문이다.
+        주말 내내 앱을 꺼 둔 참가자의 화면에서 그 주말 대화가 조용히 사라진다.
 
-        그래서 `archive/` 의 변화도 함께 본다: 바뀐 아카이브마다
-        *target 의 id 집합* − *base 시점 그 날짜의 id 집합(아카이브 ∪ 라이브)* 을
-        더한다. 이것이 정확히 "그 사이에 그 날짜에 새로 생긴 레코드"다.
-        워터마크 같은 근사가 아니라 **집합 차이**라, 이미 롤업된 날짜에 늦게
-        도착했다가 다음 롤업에 합쳐진 레코드도 정확히 한 번 잡힌다.
+        그래서 트리의 차이가 아니라 **범위 안의 커밋들이 실제로 추가한 경로**를
+        묻는다 (`git log --diff-filter=A`). 상쇄가 정의상 일어나지 않고, git
+        호출도 (diff 두 번 대신) **한 번**이다.
+
+        ⚠️ 예전에는 추적되던 `archive/` 의 집합 차이로 이 구멍을 메웠다. 그 보험은
+        없어졌다 — 아카이브는 이제 로컬 파일이라 diff 할 것이 없고, 애초에
+        **핸드셰이크가 더 강한 보장을 준다**: 삭제는 전원이 그 날짜를 로컬
+        아카이브로 옮긴 뒤에만 오므로, 삭제가 도착할 때 그 레코드들은 이미 내
+        디스크에 있다 (그래도 어긋날 수 있는 경로는 `recover_archive()` 가 메운다).
         """
         res = self.git.run(
-            "diff", "--name-only", "--diff-filter=d", "-z", base, target,
-            "--", records.RECORD_DIR + "/", check=False,
+            "log", "--diff-filter=A", "--name-only", "--pretty=format:", "-z",
+            f"{base}..{target}", "--", records.RECORD_DIR + "/", check=False,
         )
         if res.returncode != 0:
             return self._all_ids(target)
-        out = {p for p in res.stdout.split("\x00") if p.endswith(".json")}
-
-        adiff = self.git.run(
-            "diff", "--name-only", "-z", base, target,
-            "--", _rollup.ARCHIVE_DIR + "/", check=False,
-        )
-        if adiff.returncode != 0:
-            return sorted(out)
-        days = {
-            d
-            for d in (
-                _rollup.day_from_archive(x)
-                for x in adiff.stdout.split("\x00")
-                if x
-            )
-            if d
+        out = {
+            path
+            for chunk in res.stdout.split("\x00")
+            for path in chunk.splitlines()
+            if path.endswith(".json")
         }
-        if days:
-            base_live, base_arch = self._tree_index(base)
-            tgt_arch = self._archive_index(target)
-            for day in days:
-                if day not in tgt_arch:
-                    continue
-                seen = set(self._day_ids(day, base_live.get(day), base_arch.get(day)))
-                out |= set(self._archive_ids(day, tgt_arch[day])) - seen
         return sorted(out)
 
     def _reachable(self, sha: str | None) -> bool:
@@ -1645,41 +1736,68 @@ class Channel:
         except OSError:
             data = None
         if data is None:
-            line = self._archived_line(rid, ref)
+            line = self._archived_line(rid)
             if line is not None:
                 data = (line + "\n").encode("utf-8")
-        if data is None:
-            if not ref:
-                return None
+        if data is None and ref:
             res = self.git.run("show", f"{ref}:{rid}", check=False)
-            if res.returncode != 0:
-                return None
-            data = res.stdout.encode("utf-8")
+            if res.returncode == 0:
+                data = res.stdout.encode("utf-8")
+        if data is None:
+            # ⭐ 마지막 수단 — **히스토리에서 꺼낸다.** 살아 있는 파일도, 로컬
+            # 아카이브도, 지금 트리도 이 id 를 모른다. 그래도 이 id 는 *한때
+            # 존재했다*(누군가 커서·답장·diff 로 받았다)는 뜻이므로, 그것을
+            # 추가한 커밋을 찾아 원본을 읽는다. 조용히 없는 것으로 넘기면
+            # 그 순간이 유실 지점이 된다.
+            data = self._record_from_history(rid)
+        if data is None:
+            log.error(
+                "gitwire: 레코드를 어디서도 찾지 못했다 (히스토리에도 없다): %s", rid
+            )
+            return None
         try:
             return records.decode(data, rid)
         except records.RecordDecodeError:
             log.warning("gitwire: 해석할 수 없는 레코드를 건너뛴다: %s", rid)
             return None
 
-    def _archived_line(self, rid: str, ref: str | None) -> str | None:
-        """아카이브 안에서 이 id 의 줄을 찾는다 (없으면 None).
+    def _record_from_history(self, rid: str) -> bytes | None:
+        """이 레코드를 **추가한 커밋**에서 원본 바이트를 꺼낸다 (없으면 None).
+
+        `git log --diff-filter=A -1 -- <경로>` 는 pathspec 으로 좁혀지고 첫 매치에서
+        멈추므로 히스토리가 길어도 값이 싸다. 이 경로는 드물게만 탄다 (레코드가
+        삭제됐고 내 로컬 아카이브에도 없는 경우).
+        """
+        if not records.is_record_id(rid):
+            return None
+        res = self.git.run(
+            "log", "--diff-filter=A", "-1", "--format=%H", "--", rid, check=False
+        )
+        commit = res.stdout.strip() if res.returncode == 0 else ""
+        if not commit:
+            return None
+        got = self.git.run("show", f"{commit}:{rid}", check=False)
+        if got.returncode != 0:
+            return None
+        return got.stdout.encode("utf-8")
+
+    def _archived_line(self, rid: str) -> str | None:
+        """**로컬** 아카이브 안에서 이 id 의 줄을 찾는다 (없으면 None).
 
         하루치 아카이브 **한 파일만** 연다. 연속으로 같은 날짜를 읽는 페이징을
         위해 마지막으로 연 아카이브 하나를 메모해 둔다 (한 페이지 = 보통 하루~이틀).
         """
         day = _rollup.day_of(rid)
-        if not day or not ref:
+        if not day:
             return None
-        try:
-            sha = self._archive_index(ref).get(day)
-        except GitError:
+        stamp = self._archive_days().get(day)
+        if not stamp:
             return None
-        if not sha:
-            return None
-        if self._archive_memo[0] != sha:
+        key = f"{day}:{stamp}"
+        if self._archive_memo[0] != key:
             try:
-                self._archive_memo = (sha, self._archive_lines(day, sha))
-            except (GitError, _rollup.ArchiveFormatError) as exc:
+                self._archive_memo = (key, self._archive_lines(day))
+            except (OSError, ValueError, _rollup.ArchiveFormatError) as exc:
                 log.warning("gitwire: 아카이브 %s 를 읽지 못했다: %s", day, exc)
                 return None
         return self._archive_memo[1].get(rid)
@@ -1928,9 +2046,9 @@ class Channel:
                 cur = self._advance(cur, target, 1, [rid], mode)
                 delivered += 1
         # 락을 놓은 뒤에 본다 — 후보가 있으면 배경 스레드로 나간다 (여기서 기다리지
-        # 않는다). 폴링 경로에 다는 이유: 상시 소비자가 도는 동안에만 접으면 되고,
-        # 일회성 CLI 호출이 롤업 때문에 느려지면 안 되기 때문이다.
-        self.maybe_rollup()
+        # 않는다). 폴링 경로에 다는 이유: 상시 소비자가 도는 동안에만 옮기면 되고,
+        # 일회성 CLI 호출이 아카이빙 때문에 느려지면 안 되기 때문이다.
+        self.maybe_archive()
         return delivered
 
     def subscribe(
@@ -1978,13 +2096,14 @@ class Channel:
         th.start()
         return Subscription(self, th, stop)
 
-    # --------------------------------------------------- 지난 날짜 롤업 (비파괴)
+    # ---------------------------- 지난 날짜 아카이빙 (로컬) + 레코드 삭제 (합의 뒤)
 
     def _git_index(self, index_path: Path) -> Git:
         """**임시 인덱스**로 동작하는 git 핸들.
 
-        롤업은 작업 사본과 진짜 인덱스를 **한 바이트도 건드리지 않는다.** 그래야
-        롤업이 도는 동안 발행·읽기가 그대로 흐르고, 중간에 죽어도 남는 것이 없다.
+        레코드 삭제 커밋은 작업 사본과 진짜 인덱스를 **한 바이트도 건드리지
+        않는다.** 그래야 그 작업이 도는 동안 발행·읽기가 그대로 흐르고, 중간에
+        죽어도 남는 것이 없다.
         """
         env = dict(self.credential.env(self.dir))
         env["GIT_INDEX_FILE"] = str(index_path)
@@ -1992,259 +2111,469 @@ class Channel:
             self._runner, self.clone_dir, env=env, secrets=self.credential.secrets()
         )
 
-    def _rollup_candidates(self, ref: str, now) -> list[str]:
-        """접을 만한 지난 날짜 (이름만 — 캐시된 나열 1회, 레코드는 열지 않는다).
+    # ------------------------------------------------------------- 아카이빙
 
-        `now` 를 **인자로 받는다**: `HttpDateClock.now()` 는 주기적으로 HTTP 왕복을
-        하므로 채널 락 안에서 부르면 안 된다 (그 순간 읽기·쓰기가 통째로 막힌다).
+    def _merge_archive(self, day: str, tree: str | None) -> tuple[bytes, list[str]]:
+        """그 날짜의 **합쳐진** 아카이브 바이트와 지금 살아 있는 레코드 id 목록.
+
+        ⭐ **언제나 합집합이다** — *기존 로컬 아카이브* ∪ *지금 살아 있는 레코드*.
+        예전에는 "이미 아카이브가 있으면" 이라는 조건 분기였는데(`if day in arch`),
+        이제는 그것이 이 동작의 본체다: 로컬 아카이브가 삭제 뒤의 **유일한 사본**
+        이므로, 다시 쓸 때 기존 줄을 잃으면 그 순간이 유실 지점이다. 시계가 어긋난
+        다른 참가자가 지난 날짜에 레코드를 더해도 한 건도 잃지 않는다.
+
+        접을 수 없는 바이트나 레코드가 아닌 항목을 만나면 올린다 — **접을 수 없는
+        것은 옮기지도, 지우지도 않는다.**
         """
-        try:
-            live, _ = self._tree_index(ref)
-        except GitError:
-            return []
-        return _rollup.closed_days(live, now, self.rollup_grace_hours)
+        lines = dict(self._archive_lines(day))
+        live_ids: list[str] = []
+        if tree:
+            entries, clean = self._day_blobs(day, tree)
+            if not clean:
+                raise _rollup.ArchiveFormatError(
+                    "레코드가 아닌 항목이 섞여 있다 — 접지 않는다"
+                )
+            for name, sha in entries:
+                rid = f"{records.RECORD_DIR}/{day}/{name}"
+                lines[rid] = _rollup.canonical_line(self._blob_bytes(sha, rid))
+                live_ids.append(rid)
+        return _rollup.build_archive(lines), sorted(live_ids)
 
-    def _rollup_plan(
+    def _archive_one(self, day: str, tree: str | None) -> dict:
+        """한 날짜를 로컬 아카이브 파일로 옮긴다 (**멱등**).
+
+        합친 결과가 이미 디스크에 있는 바이트와 같으면 **쓰지 않는다.** 그래서
+        되풀이 호출이 mtime 을 흔들지 않고(= 캐시 열쇠가 그대로), 배경 아카이빙이
+        같은 날짜를 매시간 다시 봐도 비용이 읽기뿐이다.
+        """
+        data, live_ids = self._merge_archive(day, tree)
+        written = False
+        if data != self._archive_bytes(day):
+            _rollup.write_archive(self.clone_dir, day, data)
+            written = True
+        self._archived_tree[day] = tree or ""
+        return {"day": day, "records": len(live_ids), "written": written}
+
+    def archive_days(
         self,
-        base: str,
         *,
-        grace_hours: float,
-        min_records: int,
+        grace_hours: float | None = None,
         days: Sequence[str] | None = None,
         force: bool = False,
-    ) -> tuple[list[tuple[str, bytes, list[str]]], dict[str, str]]:
-        """`base` 커밋에서 접을 날짜와 **그 날짜의 아카이브 바이트**를 계산한다.
+    ) -> dict:
+        """⭐ 지난 날짜를 **로컬 아카이브 파일**로 옮긴다 (레코드는 그대로 둔다).
 
-        ⭐ 이 함수는 `base` 의 **순수 함수**다. 같은 커밋을 보는 두 참가자는 항상
-        같은 바이트를 얻는다 (`rollup.build_archive`). 그것이 조정 없이 동시 롤업을
-        성립시키는 유일한 장치다.
+        ⚠️ **여기서 아무것도 커밋하지 않는다.** 아카이브는 추적되지 않는 로컬
+        파일이고(`rollup.py` 상단), 커밋되는 것은 나중의 *레코드 삭제*뿐이다
+        (`drop_days` — 전원 확인응답 뒤 소비자가 시킬 때만).
+
+        네트워크를 쓰지 않는다 (로컬 HEAD 를 읽는다). 최신 상태에서 옮기고 싶으면
+        호출자가 먼저 `sync()` 한다.
+
+        반환값의 `through` 는 **확인응답용 날짜 워터마크**다 — "이 날짜까지는 내가
+        가진 모든 레코드를 로컬 아카이브로 옮겼다". 접지 못한 날이 있으면 그 **앞
+        날짜**까지만 올라간다(그 뒤로는 멈춘다 — 건너뛰고 올리면 그 날의 레코드가
+        내 아카이브에 없는데도 남들이 지울 수 있다). `days=`·`force=` 로 부분
+        실행하면 워터마크를 계산하지 않는다(`None`).
         """
-        live, arch = self._tree_index(base)
+        self.open()
+        # ⚠️ 시계는 락 밖에서 (HttpDateClock.now() 는 네트워크 왕복일 수 있다).
         now = self.clock.now()
-        wanted = set(days) if days else None
-        plan: list[tuple[str, bytes, list[str]]] = []
+        grace = self.archive_grace_hours if grace_hours is None else float(grace_hours)
+        with self._lock:
+            head = self._head()
+            live = self._live_days(head) if head else {}
+        wanted = {d for d in days} if days is not None else None
+        targets = [
+            d
+            for d in sorted(live)
+            if _rollup.is_day(d)
+            and (wanted is None or d in wanted)
+            and (force or _rollup.is_closed(d, now, grace))
+        ]
+        archived: list[str] = []
+        written: list[str] = []
         skipped: dict[str, str] = {}
-        for day in sorted(live):
-            if wanted is not None and day not in wanted:
-                continue
-            if not force and not _rollup.is_closed(day, now, grace_hours):
-                if wanted is not None:
-                    skipped[day] = "아직 지난 날이 아니다"
-                continue
-            entries, clean = self._day_blobs(day, live[day])
-            if not entries:
-                continue
-            if not clean:
-                skipped[day] = "레코드가 아닌 항목이 섞여 있다 — 접지 않는다"
-                log.warning("gitwire: 롤업 건너뜀 %s — %s", day, skipped[day])
-                continue
-            if day not in arch and len(entries) < min_records:
-                skipped[day] = f"레코드 {len(entries)}건 (최소 {min_records}건)"
-                continue
-            lines: dict[str, str] = {}
+        total = 0
+        for day in targets:
             try:
-                if day in arch:
-                    # 이미 아카이브가 있다 = 이 날짜에 **뒤늦게 도착한 레코드**다.
-                    # 기존 줄과 합집합을 만든다 (한 건도 버리지 않는다).
-                    lines.update(self._archive_lines(day, arch[day]))
-                for name, sha in entries:
-                    rid = f"{records.RECORD_DIR}/{day}/{name}"
-                    lines[rid] = _rollup.canonical_line(self._blob_bytes(sha, rid))
-            except (GitError, _rollup.ArchiveFormatError) as exc:
-                skipped[day] = f"접을 수 없다: {exc}"
-                log.warning("gitwire: 롤업 건너뜀 %s — %s", day, exc)
+                got = self._archive_one(day, live[day])
+            except (GitwireError, OSError, ValueError) as exc:
+                skipped[day] = f"옮길 수 없다: {exc}"
+                log.warning("gitwire: 아카이빙 건너뜀 %s — %s", day, exc)
                 continue
-            paths = [f"{records.RECORD_DIR}/{day}/{name}" for name, _ in entries]
-            plan.append((day, _rollup.build_archive(lines), paths))
-        return plan, skipped
+            archived.append(day)
+            total += got["records"]
+            if got["written"]:
+                written.append(day)
+        through: str | None = None
+        if wanted is None and not force:
+            through = _rollup.last_closed_day(now, grace)
+            if skipped:
+                limit = _rollup.previous_day(min(skipped))
+                through = min(through, limit) if through else limit
+        return {
+            "archived": archived,
+            "written": written,
+            "records": total,
+            "skipped": skipped,
+            "through": through,
+        }
 
-    def _rollup_commit(self, base: str, plan) -> str:
+    def archived_ids(self, day: str) -> list[str]:
+        """그 날짜의 **로컬 아카이브**에 담긴 레코드 id (오름차순). 없으면 빈 목록."""
+        self.open()
+        stamp = self._archive_days().get(day)
+        return list(self._archive_ids(day, stamp)) if stamp else []
+
+    def archive_state(self) -> dict:
+        """로컬 아카이브 현황 (관측용) — {날짜: 스탬프}. git 호출 0개."""
+        self.open()
+        return self._archive_days()
+
+    # ------------------------------------------------------------ 레코드 삭제
+
+    def _drop_commit(self, base: str, plan: Sequence[tuple[str, list[str]]]) -> str:
         """계획을 **커밋 하나**로 만든다 (아직 push 하지 않는다).
 
         임시 인덱스 + `commit-tree` 만 쓴다 → 작업 사본·진짜 인덱스·현재 브랜치가
-        전혀 바뀌지 않는다. 만들어진 커밋은 `base` 를 부모로 갖고, 그 트리는
-        `base` 의 순수 함수다.
+        전혀 바뀌지 않는다. 만들어진 커밋은 `base` 를 부모로 갖는다.
         """
         tmp = self.dir / "tmp"
         tmp.mkdir(parents=True, exist_ok=True)
         uniq = f"{os.getpid()}-{threading.get_ident()}"
-        index = tmp / f"rollup-{uniq}.index"
-        scratch: list[Path] = []
+        index = tmp / f"drop-{uniq}.index"
         try:
             if index.exists():
                 index.unlink()
             g = self._git_index(index)
             g.run("read-tree", base)
             total = 0
-            for day, content, paths in plan:
-                f = tmp / f"rollup-{uniq}-{day}.jsonl"
-                f.write_bytes(content)
-                scratch.append(f)
-                sha = g.out("hash-object", "-w", "--no-filters", "--", str(f))
+            for day, paths in plan:
                 g.run(
                     "rm", "--cached", "-r", "-f", "-q",
                     "--", f"{records.RECORD_DIR}/{day}",
                 )
-                g.run(
-                    "update-index", "--add", "--cacheinfo",
-                    f"100644,{sha},{_rollup.archive_path(day)}",
-                )
                 total += len(paths)
             tree = g.out("write-tree")
             msg = (
-                f"gitwire: 지난 날짜 롤업 — {len(plan)}일 / 레코드 {total}건 "
-                f"→ {_rollup.ARCHIVE_DIR}/"
+                f"gitwire: 아카이브된 지난 날짜 삭제 — {len(plan)}일 / "
+                f"레코드 {total}건 (전원 확인응답 뒤)"
             )
             return g.out("commit-tree", tree, "-p", base, "-m", msg)
         finally:
-            for f in scratch:
-                try:
-                    f.unlink()
-                except OSError:
-                    pass
             try:
                 index.unlink()
             except OSError:
                 pass
 
-    def rollup(
+    def drop_days(
         self,
+        days: Sequence[str],
         *,
         grace_hours: float | None = None,
-        min_records: int | None = None,
-        days: Sequence[str] | None = None,
         force: bool = False,
-        attempts: int = DEFAULT_ROLLUP_ATTEMPTS,
+        attempts: int = DEFAULT_DROP_ATTEMPTS,
     ) -> dict:
-        """⭐ 지난 날짜 롤업 — 하루치 레코드를 아카이브 파일 1개로 접는다 (비파괴).
+        """⭐ 아카이브된 지난 날짜의 **레코드를 지운다** (평범한 커밋 1개 + push).
+
+        ⚠️ **합의 판정은 호출자(소비자)의 몫이다.** 기반은 "누가 무엇을 확인응답
+        했는지"를 모른다 — 그건 참가자 상태 파일 안의 소비자 스키마다
+        (`state.py`). 기반이 지키는 것은 **두 가지 안전장치**다:
+
+        1. **내가 실제로 담지 않은 레코드는 지우지 않는다.** 지우기 직전에 그
+           날짜를 한 번 더 아카이빙(합집합·멱등)하고, 살아 있는 레코드 전부가 내
+           로컬 아카이브에 있는지 확인한다. 하나라도 없으면 그 날짜를 건너뛴다.
+        2. **fast-forward push 만 한다.** 우리가 보지 못한 레코드가 원격에 있으면
+           push 자체가 거부되고, 새 원격 상태에서 **처음부터 다시 계산**한다.
+           경합에서 진 쪽은 pull 하면 이미 지워져 있어 할 일이 없어진다 — 락도
+           리더 선출도 없다.
 
         `compact()` 와 **다른 물건이다**: force-push 도 히스토리 재작성도 없다.
-        평범한 커밋 하나로 `archive/<날짜>.jsonl` 을 추가하고 그 날짜의 레코드
-        파일을 지운다. 레코드는 **한 건도 버리지 않는다** — 옮길 뿐이고, id 는
-        그대로다. 형식·근거는 `rollup.py`.
-
-        ⭐ **원본 삭제와 아카이브 추가가 같은 커밋 안에 있다.** 그래서 "지웠는데
-        아카이브가 없는" 중간 상태가 존재할 수 없고, push 되기 전에는 로컬에서도
-        아무것도 지워지지 않는다 (중간에 죽어도 잃는 것이 없다).
-
-        ⭐ **동시 롤업은 조정하지 않는다.** 커밋의 트리는 부모 커밋의 순수 함수이고
-        push 는 그 부모를 여전히 가리킬 때만 통과한다(fast-forward). 즉 *우리가
-        보지 못한 레코드가 원격에 있으면 push 자체가 거부된다* — 유실이 구조적으로
-        불가능하다. 거부되면 새 원격 상태에서 **처음부터 다시 계산**한다. 같은
-        집합을 봤다면 상대의 결과가 이미 내 결과와 같으므로 할 일이 없어지고,
-        다른 집합을 봤다면 이번엔 합집합으로 다시 만든다. 락도 리더 선출도 없다.
+        지워진 레코드는 히스토리에 그대로 남아 있어 `recover_archive()` 로 꺼낼 수
+        있다.
         """
         self.open()
-        self.flush()                 # 내 미푸시 레코드를 먼저 올린다 (이번 롤업에 포함되게)
-        grace = self.rollup_grace_hours if grace_hours is None else float(grace_hours)
-        minr = (
-            self.rollup_min_records if min_records is None else max(1, int(min_records))
-        )
+        self.flush()                 # 내 미푸시 레코드를 먼저 올린다
+        now = self.clock.now()
+        grace = self.archive_grace_hours if grace_hours is None else float(grace_hours)
+        wanted = sorted({d for d in days if _rollup.is_day(d)})
+        if not wanted:
+            return {"dropped": False, "reason": "지울 날짜가 없다", "days": []}
         skipped: dict[str, str] = {}
         tries = max(1, int(attempts))
         for attempt in range(1, tries + 1):
-            # 네트워크는 락 밖, 통합만 락 안 (`_pull`). fetch 실패는 조용히
-            # 넘어간다 — 오래된 base 는 아래 push 거부로 반드시 드러난다.
+            # 네트워크는 락 밖, 통합만 락 안 (`_pull`). 오래된 base 는 아래 push
+            # 거부로 반드시 드러난다.
             base = self._pull()
             if base is None:
-                return {"rolled": False, "reason": "원격 브랜치가 없다", "days": []}
-            plan, skipped = self._rollup_plan(
-                base, grace_hours=grace, min_records=minr, days=days, force=force
-            )
+                return {"dropped": False, "reason": "원격 브랜치가 없다", "days": []}
+            live = self._live_days(base)
+            plan: list[tuple[str, list[str]]] = []
+            skipped = {}
+            for day in wanted:
+                tree = live.get(day)
+                if tree is None:
+                    continue                      # 이미 지워졌다 (남이 했다)
+                if not force and not _rollup.is_closed(day, now, grace):
+                    skipped[day] = "아직 지난 날이 아니다"
+                    continue
+                entries, clean = self._day_blobs(day, tree)
+                if not entries:
+                    continue
+                if not clean:
+                    skipped[day] = "레코드가 아닌 항목이 섞여 있다 — 지우지 않는다"
+                    log.warning("gitwire: 삭제 건너뜀 %s — %s", day, skipped[day])
+                    continue
+                try:
+                    self._archive_one(day, tree)   # 멱등 — 늦게 도착한 것까지 담는다
+                except (GitwireError, OSError, ValueError) as exc:
+                    skipped[day] = f"아카이브를 갱신하지 못했다: {exc}"
+                    log.warning("gitwire: 삭제 건너뜀 %s — %s", day, exc)
+                    continue
+                have = set(self._archive_lines(day))
+                paths = [f"{records.RECORD_DIR}/{day}/{name}" for name, _ in entries]
+                missing = [rid for rid in paths if rid not in have]
+                if missing:
+                    skipped[day] = (
+                        f"내 로컬 아카이브에 없는 레코드 {len(missing)}건 — 지우지 않는다"
+                    )
+                    log.error("gitwire: 삭제 거부 %s — %s", day, skipped[day])
+                    continue
+                plan.append((day, paths))
             if not plan:
                 return {
-                    "rolled": False, "reason": "접을 지난 날짜가 없다",
+                    "dropped": False, "reason": "지울 날짜가 없다",
                     "days": [], "skipped": skipped, "attempts": attempt,
                 }
-            commit = self._rollup_commit(base, plan)
-            # push 와 뒤이은 로컬 통합은 하나의 원격 전이다 → `_remote` 안에서
-            # (채널 락은 여전히 잡지 않는다 — 발행·읽기가 계속 흐른다).
+            commit = self._drop_commit(base, plan)
             with self._remote:
                 try:
                     self.git.run("push", "origin", f"{commit}:refs/heads/{self.branch}")
                 except PushRejected:
                     log.info(
-                        "gitwire: 롤업 push 경합 (%d/%d) — 새 원격 상태에서 다시 계산한다",
+                        "gitwire: 삭제 push 경합 (%d/%d) — 새 원격 상태에서 다시 계산한다",
                         attempt, tries,
                     )
                     continue
-                # 원격이 확정됐다. 로컬을 따라오게 한다 (통합만 채널 락 안).
                 self._pull()
             return {
-                "rolled": True, "commit": commit, "base": base,
-                "days": [d for d, _, _ in plan],
-                "records": sum(len(x[2]) for x in plan),
+                "dropped": True, "commit": commit, "base": base,
+                "days": [d for d, _ in plan],
+                "records": sum(len(x[1]) for x in plan),
                 "skipped": skipped, "attempts": attempt,
             }
         return {
-            "rolled": False, "reason": "push 경합이 반복돼 이번엔 접지 않았다",
+            "dropped": False, "reason": "push 경합이 반복돼 이번엔 지우지 않았다",
             "days": [], "skipped": skipped, "attempts": tries,
         }
 
-    def maybe_rollup(self) -> bool:
-        """조건이 맞으면 롤업을 **배경 스레드로** 띄운다. 띄웠으면 True.
+    # ------------------------------------------------------------- 자동 복구
 
-        ⭐ 사용자가 특히 강조한 지점 — *"이 작업한다고 다른 동작을 못하면 안 된다."*
-        그래서 이 함수 자체가 하는 일은 **캐시된 나열 1회**뿐이고(레코드 blob 을
-        열지 않는다), 실제 작업은 전부 별도 스레드로 나간다. 그 스레드도 채널 락을
-        길게 쥐지 않는다 (`rollup()` 참조 — 네트워크는 전부 락 밖).
+    def deleted_days(self, base: str, target: str) -> list[str]:
+        """base 에는 살아 있었는데 target 에는 없는 날짜 (= 그 사이에 지워진 날).
 
-        **빈도의 근거**: 접을 수 있는 날짜가 늘어나는 사건은 하루에 한 번(UTC 자정
-        + 유예)뿐이다. 그보다 자주 볼 이유가 없고, 그보다 드물게 보면 접히는 시점이
-        늦어진다. 기본 1시간은 "하루 한 번 생기는 사건을 1시간 안에 알아챈다"는
-        뜻이고, 확인 비용이 사실상 0(캐시 적중 시 git 호출 0회)이라 더 촘촘히 볼
-        이유도 없다. 후보가 없으면 스레드조차 만들지 않는다.
+        두 나열 모두 커밋 sha 로 캐시되므로 보통 **git 호출이 0회**다. 소비자가
+        "삭제를 pull 로 받았다"를 알아채는 자리다.
         """
-        if not self.auto_rollup:
+        self.open()
+        return sorted(set(self._live_days(base)) - set(self._live_days(target)))
+
+    def recover_archive(self, day: str) -> dict:
+        """⭐ 지워진 날짜의 레코드를 **히스토리에서 꺼내** 로컬 아카이브에 채운다.
+
+        언제 필요한가: 내가 확인응답을 하지 않았는데(또는 응답 뒤에 늦은 레코드가
+        더해졌는데) 남이 그 날짜를 지웠다. 그러면 내 로컬 아카이브가 없거나
+        **불완전**하다. 삭제는 평범한 커밋이라 지워진 레코드가 히스토리에 그대로
+        남아 있으므로, *그 날짜를 지운 커밋들의 부모*에서 꺼내 합친다.
+
+        **합집합이라 멱등하다** — 이미 완전하면 아무것도 쓰지 않고 `added=0`.
+
+        ⚠️ **히스토리가 있는 범위에서만 가능하다.** shallow 클론이거나 누군가
+        `compact()` 로 히스토리를 재작성했으면 꺼낼 원본이 없다. 그때는 조용히
+        넘기지 않고 `problems` 에 담아 돌려주고 로그에 남긴다 — 화면에 알리는
+        것은 소비자 몫이다.
+        """
+        self.open()
+        if not _rollup.is_day(day):
+            raise ValueError(f"날짜 형식이 아니다: {day!r}")
+        res = self.git.run(
+            "log", "--format=%H", "--diff-filter=D",
+            "--", f"{records.RECORD_DIR}/{day}/", check=False,
+        )
+        commits = res.stdout.split() if res.returncode == 0 else []
+        if not commits:
+            return {
+                "recovered": False, "day": day, "added": 0, "problems": [],
+                "reason": "히스토리에 이 날짜의 레코드 삭제 기록이 없다",
+            }
+        try:
+            lines = dict(self._archive_lines(day))
+        except (OSError, ValueError) as exc:
+            log.warning("gitwire: 아카이브 %s 를 읽지 못했다 — 새로 만든다: %s", day, exc)
+            lines = {}
+        before = len(lines)
+        problems: list[str] = []
+        for commit in commits:
+            got = self.git.run(
+                "ls-tree", "-r", "-z", f"{commit}^",
+                "--", f"{records.RECORD_DIR}/{day}/", check=False,
+            )
+            if got.returncode != 0:
+                problems.append(f"{commit[:8]}^ 의 트리를 읽지 못했다 (히스토리가 없다)")
+                continue
+            for entry in got.stdout.split("\x00"):
+                if not entry:
+                    continue
+                meta, _, path = entry.partition("\t")
+                fields = meta.split()
+                if len(fields) < 3 or fields[1] != "blob" or not path.endswith(".json"):
+                    continue
+                if path in lines:
+                    continue
+                try:
+                    lines[path] = _rollup.canonical_line(
+                        self._blob_bytes(fields[2], path)
+                    )
+                except (GitError, _rollup.ArchiveFormatError) as exc:
+                    problems.append(f"{path}: {exc}")
+        added = len(lines) - before
+        if added:
+            _rollup.write_archive(self.clone_dir, day, _rollup.build_archive(lines))
+            log.info("gitwire: 아카이브 %s 를 히스토리에서 복구했다 (%d건)", day, added)
+        if problems:
+            log.error(
+                "gitwire: 아카이브 %s 를 완전히 복구하지 못했다 — %s",
+                day, "; ".join(problems[:3]),
+            )
+        return {
+            "recovered": added > 0, "day": day, "added": added,
+            "problems": problems, "commits": list(commits),
+        }
+
+    def archive_gaps(self, through: str, *, max_days: int = 60) -> list[str]:
+        """`through` 부터 거슬러 올라가며 **라이브도 아니고 로컬 아카이브도 없는** 날짜.
+
+        기동 직후 한 번 훑는 자리다 (그 사이에 남이 지운 날짜를 놓치지 않게).
+        git 호출은 나열 1회뿐이고(캐시되면 0회), 실제로 꺼내는 일은
+        `recover_archive()` 가 날짜별로 한다 — 레코드가 없던 날은 그쪽이 조용히
+        `recovered=False` 로 돌려준다.
+
+        `max_days` 로 범위를 묶는다 — 무한히 거슬러 올라가면 기동이 느려지고,
+        아주 오래된 날짜는 히스토리가 없어 어차피 꺼낼 수 없다.
+        """
+        self.open()
+        if not _rollup.is_day(through):
+            return []
+        # ⭐ 이 레포에서 레코드가 **한 번도 지워지지 않았다면** 빈 날짜를 찾을
+        # 이유가 없다 (그 날에 레코드가 없었을 뿐이다). pathspec 으로 좁힌
+        # `log -1` **한 번**이 날짜별 조회 `max_days` 번을 없앤다 — 갓 만든 방에서
+        # 기동마다 60번씩 git 을 띄우지 않는 근거다.
+        probe = self.git.run(
+            "log", "-1", "--format=%H", "--diff-filter=D",
+            "--", records.RECORD_DIR + "/", check=False,
+        )
+        if probe.returncode != 0 or not probe.stdout.strip():
+            return []
+        with self._lock:
+            head = self._head()
+            live = self._live_days(head) if head else {}
+        arch = self._archive_days()
+        out: list[str] = []
+        day = through
+        for _ in range(max(0, int(max_days))):
+            if day not in live and day not in arch:
+                out.append(day)
+            day = _rollup.previous_day(day)
+        return sorted(out)
+
+    # --------------------------------------------------------- 자동 아카이빙
+
+    def _archive_candidates(self, ref: str, now) -> list[str]:
+        """옮길 만한 지난 날짜 (이름만 — 캐시된 나열 1회, 레코드는 열지 않는다).
+
+        이미 옮긴 뒤 트리가 바뀌지 않은 날짜는 후보가 아니다. 그래서 합의를
+        기다리는 동안(레코드가 아직 살아 있다) 같은 날짜를 매시간 다시 옮기지
+        않는다.
+
+        `now` 를 **인자로 받는다**: `HttpDateClock.now()` 는 주기적으로 HTTP 왕복을
+        하므로 채널 락 안에서 부르면 안 된다.
+        """
+        try:
+            live = self._live_days(ref)
+        except GitError:
+            return []
+        return [
+            day
+            for day in _rollup.closed_days(live, now, self.archive_grace_hours)
+            if self._archived_tree.get(day) != live[day]
+        ]
+
+    def maybe_archive(self) -> bool:
+        """조건이 맞으면 아카이빙을 **배경 스레드로** 띄운다. 띄웠으면 True.
+
+        ⭐ 하는 일이 **로컬 파일 쓰기뿐**이다 — 커밋도 push 도 네트워크도 없다.
+        그래서 켜 두어 잃는 것이 없고(소비자의 일일 배치가 멈춰 있어도 로컬
+        아카이브는 만들어져 있다), 대화를 막지도 않는다. 이 함수 자체가 하는 일은
+        **캐시된 나열 1회**뿐이고 실제 작업은 별도 스레드로 나간다.
+
+        **빈도의 근거**: 옮길 수 있는 날짜가 늘어나는 사건은 하루에 한 번(UTC 자정
+        + 유예)뿐이다. 기본 1시간은 "하루 한 번 생기는 사건을 1시간 안에 알아챈다"
+        는 뜻이고, 확인 비용이 사실상 0이라 더 촘촘히 볼 이유도 없다.
+        """
+        if not self.auto_archive:
             return False
         now = time.monotonic()
         wall = self.clock.now()          # ⚠️ 락 **밖**에서 (네트워크 왕복일 수 있다)
         with self._lock:
-            running = self._rollup_thread
+            running = self._archive_thread
             if running is not None and running.is_alive():
                 return False
             if (
-                self._rollup_checked is not None
-                and now - self._rollup_checked < self.rollup_interval
+                self._archive_checked is not None
+                and now - self._archive_checked < self.archive_interval
             ):
                 return False
-            self._rollup_checked = now
+            self._archive_checked = now
             head = self._head() if self._opened else None
-            if head is None or not self._rollup_candidates(head, wall):
+            if head is None or not self._archive_candidates(head, wall):
                 return False
             th = threading.Thread(
-                target=self._rollup_bg, name="gitwire-rollup", daemon=True
+                target=self._archive_bg, name="gitwire-archive", daemon=True
             )
-            self._rollup_thread = th
+            self._archive_thread = th
         th.start()
         return True
 
-    def _rollup_bg(self) -> None:
-        """배경 롤업 1회. 실패해도 앱을 죽이지 않되 **조용히 넘어가지도 않는다**."""
+    def _archive_bg(self) -> None:
+        """배경 아카이빙 1회. 실패해도 앱을 죽이지 않되 **조용히 넘어가지도 않는다**."""
         try:
-            res = self.rollup()
-            self.rollup_last_error = None
-            if res.get("rolled"):
+            res = self.archive_days()
+            self.archive_last_error = None
+            if res.get("written"):
                 log.info(
-                    "gitwire: 지난 날짜 롤업 완료 — %s (레코드 %d건)",
-                    ", ".join(res["days"]), res["records"],
+                    "gitwire: 지난 날짜 아카이빙 — %s (레코드 %d건, 로컬 전용)",
+                    ", ".join(res["written"]), res["records"],
                 )
-            elif res.get("skipped"):
-                log.info("gitwire: 롤업 건너뛴 날짜 %s", res["skipped"])
+            if res.get("skipped"):
+                log.info("gitwire: 아카이빙 건너뛴 날짜 %s", res["skipped"])
         except BaseException as exc:  # noqa: BLE001
-            self.rollup_last_error = f"{type(exc).__name__}: {exc}"
-            log.exception("gitwire: 지난 날짜 롤업 실패 — 다음 기회에 다시 시도한다")
+            self.archive_last_error = f"{type(exc).__name__}: {exc}"
+            log.exception("gitwire: 지난 날짜 아카이빙 실패 — 다음 기회에 다시 시도한다")
 
     # ------------------------------------------------------------- 히스토리
 
     def compact(self, *, keep_records: int | None = None, confirm: bool = False) -> dict:
         """히스토리 압축 — 최근 N건만 남긴 **단일 커밋**으로 재작성 후 force-push.
 
-        ⚠️⚠️ **`rollup()` 과 혼동하지 마라.** 이름이 비슷하지만 정반대다:
-        `rollup()` 은 비파괴(평범한 커밋·레코드 보존)이고, 이쪽은 히스토리를
-        재작성해 오래된 레코드를 **버린다**. 표는 `rollup.py` 상단에 있다.
-        본 함수는 `archive/` 를 건드리지 않는다 — 아카이브된 레코드는 그대로
-        보존되고, `keep_records` 는 **살아 있는** 레코드에만 적용된다.
+        ⚠️⚠️ **아카이빙·삭제와 혼동하지 마라.** 그쪽(`archive_days`/`drop_days`)은
+        비파괴이고(로컬 파일 + 평범한 삭제 커밋, 레코드는 히스토리에 남는다),
+        이쪽은 히스토리를 **재작성해** 오래된 레코드를 영구히 **버린다**. 표는
+        `rollup.py` 상단에 있다.
+
+        ⚠️ 본 함수는 로컬 `archive/` 를 건드리지 않는다(추적되지 않으므로 애초에
+        커밋 대상이 아니다). 그러나 **히스토리를 지우므로 `recover_archive()` 의
+        원본도 함께 사라진다** — 아카이브가 없는 참가자는 그 대화를 되찾을 수 없다.
 
         ⚠️ 파괴적이다. 다른 참가자는 재작성을 감지해 reset 해야 하고, 그 시점에
         **미푸시 레코드가 있으면 날아갈 위험**이 있다. 그래서:
@@ -2288,7 +2617,7 @@ class Channel:
                 "commits_before": before,
                 "commits_after": after,
                 "records_kept": len(kept),
-                "archives_kept": len(self._archive_index("HEAD")),
+                "archives_kept": len(self._archive_days()),
             }
 
     # ------------------------------------------------------------------ 기타
@@ -2317,11 +2646,9 @@ class Channel:
                 # ⚠️ 이제 "대기열에 있는(=아직 시각도 안 찍힌) 레코드 수"다.
                 "pending": len(self._queue),
                 "pending_state": len(self._pending_state),
-                "auto_rollup": self.auto_rollup,
-                "archives": len(self._archive_index(self._head()))
-                if self._head()
-                else 0,
-                "rollup_error": self.rollup_last_error,
+                "auto_archive": self.auto_archive,
+                "archives": len(self._archive_days()),
+                "archive_error": self.archive_last_error,
             }
 
     def close(self) -> None:
@@ -2349,7 +2676,7 @@ class Channel:
                 self._queue.clear()
             if self._flusher and self._flusher.is_alive():
                 self._flusher.join(timeout=5.0)
-            th = self._rollup_thread
+            th = self._archive_thread
             if th is not None and th.is_alive():
                 th.join(timeout=10.0)
 
