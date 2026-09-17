@@ -648,6 +648,7 @@ class Channel:
         g = self.git
         g.run("add", "-A", "--", ".")
         if g.run("diff", "--cached", "--quiet", check=False).returncode == 0:
+            self._ensure_archive_ignored()
             return
         g.run("commit", "-m", "gitwire: 채널 초기화")
         try:
@@ -661,6 +662,11 @@ class Channel:
             g.run("reset", "--hard", remote)
         if not (self.clone_dir / layout.CHANNEL_META).exists():
             raise ChannelInitError("채널 레이아웃 확정 실패")
+        # ⚠️ 초기화 경로에서도 확인한다. 스켈레톤은 **없는 파일만** 심으므로
+        # (forge 가 만들어 준 `.gitignore` 가 이미 있으면 건드리지 않는다) 여기
+        # 오는 레포가 `archive/` 규칙을 갖고 있다는 보장이 없다. 위 경쟁에서 진
+        # 경우도 남의 초기화를 따라온 상태라 같은 확인이 필요하다.
+        self._ensure_archive_ignored()
 
     def _ensure_archive_ignored(self) -> None:
         """이미 쓰고 있는 채널에도 `archive/` 무시 규칙을 **한 번** 심는다.

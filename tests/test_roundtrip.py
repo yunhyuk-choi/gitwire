@@ -460,6 +460,13 @@ def test_still_initializes_a_fresh_repo_with_readme_and_license(bare_repo, tmp_p
         assert (channel.clone_dir / "gitwire.json").exists()
         rec = channel.append({"n": 1}, flush=True)
         assert [r.id for r in channel.history()] == [rec.id]
+        # ⭐ forge 가 만들어 둔 `.gitignore` 는 우리가 덮지 않는다(스켈레톤은 없는
+        # 파일만 심는다). 그래도 `archive/` 규칙은 **반드시** 들어가야 한다 —
+        # 없으면 로컬 아카이브가 다시 커밋에 실린다.
+        body = (channel.clone_dir / ".gitignore").read_text(encoding="utf-8")
+        lines = [ln.strip() for ln in body.splitlines()]
+        assert "*.pyc" in lines, body          # 남의 규칙은 그대로
+        assert "archive/" in lines, body       # 우리 규칙이 더해졌다
     finally:
         channel.close()
 

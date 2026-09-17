@@ -38,13 +38,23 @@ class SlowPushRunner(SubprocessGitRunner):
         return super().run(args, **kw)
 
 
-def landed(bare_repo, homes, name="verify") -> list[str]:
-    """원격에 **정말** 올라간 레코드 id (별도 클론으로 확인한다)."""
+def landed(bare_repo, homes, name="verify", *, recover=()) -> list[str]:
+    """원격에 **정말** 올라간 레코드 id (별도 클론으로 확인한다).
+
+    ⚠️ `recover=` 는 **이미 지워진 날짜**를 확인할 때 필요하다. 갓 만든 클론에는
+    그 날짜의 로컬 아카이브가 없고(아카이브는 공유되지 않는다) 레코드 파일도
+    지워져 있으므로, 날짜 축에 그 날이 아예 없다. 지워진 레코드는 **히스토리에
+    그대로** 있으므로 거기서 꺼내 온다 — 그게 규약이고(`recover_archive`),
+    그래서 "원격에 다 있다"를 여기서 정직하게 확인할 수 있다.
+    """
     ch = gitwire.Channel(
         str(bare_repo), home=homes(name), sender=name, consumer=name,
         clock=FixedOffsetClock(0.0), auto_archive=False,
     ).open()
     try:
+        for day in recover:
+            got = ch.recover_archive(day)
+            assert not got["problems"], got
         return [r.id for r in ch.history(fresh=True)]
     finally:
         ch.close()
@@ -216,10 +226,11 @@ def test_sync_does_not_interleave_with_a_running_push(participant, bare_repo, ho
 
 def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes):
     """아카이빙·삭제(로컬을 크게 바꾼다)와 발행·flush 가 겹쳐도 유실·중복이 없다."""
-    from test_archive import write_past   # noqa: PLC0415
+    from test_archive import day_of, write_past   # noqa: PLC0415
 
     a = participant("a", batch_window=3600.0)
     old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(6)])
+    day = day_of(old[0])
 
     made = list(old)
     stop = threading.Event()
@@ -253,7 +264,8 @@ def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes
         a.archive_days()
         res = a.drop_days(arch["archived"])
     assert res["dropped"] is True, res
-    got = landed(bare_repo, homes)
+    # 지워진 날짜는 검증용 새 클론에서 히스토리로 꺼내 확인한다 (`landed` 도크).
+    got = landed(bare_repo, homes, recover=[day])
     assert sorted(got) == sorted(r.id for r in made), (
         set(r.id for r in made) - set(got)
     )
