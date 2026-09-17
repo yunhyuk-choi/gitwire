@@ -129,6 +129,10 @@ def credential_cache(
     git 이 표준으로 제공하는 `credential-cache` 헬퍼 한 줄이다. 무엇을 사고
     무엇을 파는지는 `Channel._configure_credential_helpers()` 의 주석에 있다 —
     **켜기 전에 읽어라.** 기본값은 끔(옵트인)이다.
+
+    ⚠️ `git-credential-cache` 는 **없는 머신이 있다** (실측: Windows 의 git
+    배포에는 `git-credential-wincred.exe` 만 들어 있다). 그래서 기본 경로는
+    이것이 아니라 OS 기본 저장소 헬퍼다 (`gitcmd.credential_config`).
     """
     return [f"cache --timeout={max(1, int(timeout))}"]
 
@@ -538,6 +542,13 @@ class Channel:
 
     def _configure_credential_helpers(self) -> None:
         """이 클론의 **로컬** `credential.helper` 사슬을 다시 짠다 (옵트인).
+
+        ⚠️ 기본 경로는 이것이 **아니다.** 아무것도 주지 않으면 `gitcmd` 가
+        네트워크 호출에만 OS 기본 저장소 헬퍼를 `-c` 로 얹는다
+        (`gitcmd.credential_config` — 설정 파일을 건드리지 않는다). 여기 오는
+        것은 소비자가 사슬을 **직접** 짠 경우뿐이고, 그때는 그 지정이 비켜선다
+        (`_git()` 의 `cheap_credentials`) — 그러지 않으면 우리가 목록을
+        초기화해 이 설정을 무효로 만든다.
 
         왜 이런 게 필요한가 — 실측(Windows 11 · git 2.51 · GitHub private repo,
         같은 머신에서 5회씩)::
@@ -1183,22 +1194,53 @@ class Channel:
             if wait_for is None and self._publishers:
                 return                      # 규칙 2 — 도는 쪽이 가져간다
             self._publishers += 1
+        released = False
         try:
             while True:
-                with self._lock:
-                    if wait_for is not None and (wait_for.pushed or wait_for.dropped):
+                with self._flush_cv:
+                    mine_done = wait_for is not None and (
+                        wait_for.pushed or wait_for.dropped
+                    )
+                    if mine_done or not self._has_pending():
+                        # ⚠️ **내려놓는 것도 같은 락 구간에서** 한다. 이 판정과
+                        # `_publishers` 감소가 갈라지면, 그 틈에 `append()` 한
+                        # 건은 "도는 쪽이 있다"고 보고 돌아가는데 도는 쪽은 이미
+                        # 나가 버려서 아무도 밀지 않는 상태가 된다 (다음 발행까지
+                        # 지연). 한 구간으로 묶으면 그 건은 *우리가 보거나*
+                        # *자기가 미는* 쪽으로 반드시 갈린다.
+                        self._publishers -= 1
+                        released = True
+                        if self._has_pending():
+                            self._arm_retry()   # `wait_for` 만 챙기고 나온 경우
+                        self._flush_cv.notify_all()
                         return
-                    if not self._has_pending():
-                        return              # 규칙 3 — 비었다
+                    # 진척 판정용 — 대기열 **맨 앞**이 누구였나. `flush()` 는 앞에서
+                    # 잘라 가므로, 앞이 그대로면 이번 회차는 아무것도 못 민 것이다.
+                    # (길이로 재면 "미는 동안 같은 수가 새로 들어온" 정상 상황을
+                    #  진척 없음으로 오판해 쓸데없이 재시도로 넘긴다.)
+                    was = self._queue[0].seq if self._queue else None
+                    states = len(self._pending_state)
                 self.flush()
+                with self._lock:
+                    now = self._queue[0].seq if self._queue else None
+                    if now == was and len(self._pending_state) >= states:
+                        # 예외도 없이 아무것도 못 나갔다 — 여기서 계속 돌면 바쁜
+                        # 루프가 된다. 배경 재시도에 넘긴다 (`finally`).
+                        log.warning(
+                            "gitwire: 발행이 진척되지 않았다 — 배경 재시도로 넘긴다 "
+                            "(대기 %d건)",
+                            len(self._queue),
+                        )
+                        return
         finally:
-            with self._flush_cv:
-                self._publishers -= 1
-                # 남은 것이 있으면(실패로 빠져나왔거나, `wait_for` 만 챙기고
-                # 나왔거나) 배경이 이어받는다 — 여기서 끊기면 조용한 유실이다.
-                if self._has_pending():
-                    self._arm_retry()
-                self._flush_cv.notify_all()
+            if not released:
+                with self._flush_cv:
+                    self._publishers -= 1
+                    # 남은 것이 있으면(= 못 밀고 빠져나왔다) 배경이 이어받는다 —
+                    # 여기서 끊기면 조용한 유실이다.
+                    if self._has_pending():
+                        self._arm_retry()
+                    self._flush_cv.notify_all()
 
     def _arm_retry(self) -> None:
         """배경 재시도 스레드를 세운다 (`_lock` 을 쥔 채 부른다).
