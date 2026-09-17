@@ -14,6 +14,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 import gitwire
 from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import SubprocessGitRunner
@@ -198,6 +200,38 @@ def test_records_appended_during_push_are_not_lost(participant, bare_repo, homes
     # 발행 순서와 다를 수 있다 — 그건 규약이지 결함이 아니다.
     assert got == sorted(expect)           # 유실·중복 없음 + 읽기는 시간순
     assert len(got) == len(set(got))
+
+
+def test_a_failed_publish_is_loud_and_keeps_retrying(participant, bare_repo, homes):
+    """밀 수 없었던 건은 **조용히 사라지지 않는다.**
+
+    두 가지를 함께 못 박는다:
+
+    1. 실패는 **부른 쪽에 예외로** 올라간다 (드레인이 삼키지 않는다).
+    2. 그래도 대기열에 남아 **배경이 계속 다시 민다** — 아무도 다음 건을
+       발행하지 않아도 원격이 돌아오는 순간 나간다. 그 재시도 간격이 이
+       설계에 남은 유일한 타이머다(배칭 창이 아니다).
+
+    그리고 그 상태에서 `close()` 가 교착 없이 끝난다.
+    """
+    from test_stamp_on_push import BlockedPushRunner   # noqa: PLC0415
+
+    runner = BlockedPushRunner()
+    a = participant("a", runner=runner)                # autopublish = 기본
+    runner.blocked = True                              # 방이 만들어진 뒤에 막는다
+
+    with pytest.raises(gitwire.GitError):
+        a.append({"n": "지금은 못 나갈 말"})
+    assert a.info()["pending"] == 1, "대기열에 남아 있지 않다"
+
+    runner.blocked = False                             # 원격이 돌아왔다
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and a.info()["pending"]:
+        time.sleep(0.2)                                # 아무도 append 하지 않는다
+    assert a.info()["pending"] == 0, "배경 재시도가 밀지 않았다"
+    assert len(landed(bare_repo, homes)) == 1
+
+    a.close()                                          # 교착 없이 닫힌다
 
 
 def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, homes):

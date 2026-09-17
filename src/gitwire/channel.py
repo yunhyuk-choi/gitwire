@@ -1298,6 +1298,11 @@ class Channel:
         시도가 그때의 시각을 다시 찍는다. 그래서 과거 날짜 레코드가 새로 생기는
         경로가 남지 않는다.
 
+        ⭐ **한 회차다** — 대기열 앞에서 `max_batch` 개까지만 가져간다. 비워질
+        때까지 되풀이하는 것은 `_drain()` 의 일이고, `flush()` 를 직접 부르는
+        쪽(`close()`·`autopublish=False` 인 호출자)은 상한을 넘긴 잔여가 남을 수
+        있음을 알아야 한다.
+
         ⭐ **순서를 지킨다.** 대기열 앞에서부터 잘라 한 커밋으로 밀고, 그 push 가
         성공할 때까지 뒤 건을 따로 보내지 않는다(같은 커밋에 실리거나, 실패하면
         함께 대기열로 돌아간다). `_remote` 가 flush 끼리를 직렬화하므로 두 push
@@ -2779,6 +2784,9 @@ class Channel:
                 # ⚠️ 이제 "대기열에 있는(=아직 시각도 안 찍힌) 레코드 수"다.
                 "pending": len(self._queue),
                 "pending_state": len(self._pending_state),
+                "autopublish": self.autopublish,
+                # 지금 누가 밀고 있나 (드레인 루프 — `_drain()`)
+                "publishing": self._publishers > 0,
                 "auto_archive": self.auto_archive,
                 "archives": len(self._archive_days()),
                 "archive_error": self.archive_last_error,
