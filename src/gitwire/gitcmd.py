@@ -83,11 +83,15 @@ HELPER_ENV = "GITWIRE_CREDENTIAL_HELPER"
 
 _OFF = ("off", "0", "no", "none", "false", "")
 
-#: OS 가 기본으로 제공하는 자격증명 저장소 헬퍼.
+#: `sys.platform` 접두 → 그 OS 가 기본으로 제공하는 자격증명 저장소 헬퍼.
+#: Windows 는 `os.name` 으로 먼저 가른다 (`sys.platform` 이 `win32`·`cygwin` 로
+#: 갈리기 때문이다).
 _OS_HELPER: tuple[tuple[str, str], ...] = (
-    ("nt", "wincred"),          # Windows 자격 증명 관리자
-    ("darwin", "osxkeychain"),  # macOS 키체인
-    ("linux", "libsecret"),     # freedesktop Secret Service
+    ("darwin", "osxkeychain"),   # macOS 키체인
+    ("linux", "libsecret"),      # freedesktop Secret Service
+    ("freebsd", "libsecret"),
+    ("openbsd", "libsecret"),
+    ("netbsd", "libsecret"),
 )
 
 _cred_lock = threading.Lock()
@@ -99,12 +103,10 @@ _cred_disabled: set[str] = set()
 def _os_helper() -> str | None:
     """이 OS 의 기본 자격증명 저장소 헬퍼 이름 (모르면 None)."""
     if os.name == "nt":
-        return "wincred"
-    for key, helper in _OS_HELPER:
-        if sys.platform.startswith(key):
+        return "wincred"                 # Windows 자격 증명 관리자
+    for prefix, helper in _OS_HELPER:
+        if sys.platform.startswith(prefix):
             return helper
-    if sys.platform.startswith(("freebsd", "openbsd", "netbsd")):
-        return "libsecret"
     return None
 
 
@@ -171,10 +173,18 @@ def credential_config(git_path: str = "git") -> tuple[str, ...]:
     if forced is not None and forced.strip().lower() in _OFF:
         return ()
     name = (forced or "").strip() or _os_helper()
+    key = f"{git_path}\x00{name or ''}"
     if not name:
-        log.info("gitwire: 이 OS 의 기본 자격증명 저장소를 모른다 — 사용자 설정을 쓴다")
+        # 모르는 OS — 사용자 설정을 쓴다. 로그는 **한 번만** 남긴다 (호출마다
+        # 남기면 왕복마다 같은 줄이 쌓인다).
+        with _cred_lock:
+            first = key not in _cred_cache
+            _cred_cache[key] = ()
+        if first:
+            log.info(
+                "gitwire: 이 OS 의 기본 자격증명 저장소를 모른다 — 사용자 설정을 쓴다"
+            )
         return ()
-    key = f"{git_path}\x00{name}"
     with _cred_lock:
         if key in _cred_disabled:
             return ()
