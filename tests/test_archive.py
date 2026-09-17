@@ -410,7 +410,16 @@ def test_offline_consumer_does_not_miss_deleted_days(participant, homes):
     """
     a = participant("a")
     b = participant("b", consumer="reader")
-    b.fetch_new()                                  # 커서를 '지금'에 맞춰 둔다
+    # ⚠️ 커서를 **실제로 세워 둔다** (레코드 1건을 받아 기준 커밋을 갖게 한다).
+    # 한 번도 소비하지 않은 커서는 전량 나열 모드로 떨어지고, 그건 아래 「갓
+    # 합류한 사람」 테스트가 다루는 다른 이야기다.
+    #
+    # ⚠️ 그 1건은 **다른 채널**이 낸다. 같은 채널에서 현재 시각 레코드를 먼저
+    # 내면 스탬프 단조 증가 가드 때문에 뒤이은 "과거" 발행이 현재로 찍힌다
+    # (`Channel._stamp` — 그게 옳은 동작이다).
+    primer = participant("p")
+    first = primer.append({"n": "before"}, flush=True)
+    assert [r.id for r in b.fetch_new()] == [first.id]
 
     weekend = write_past(a, 2, [{"n": i} for i in range(6)])
     fold(a)                                        # b 가 자는 사이에 지워졌다
@@ -418,8 +427,20 @@ def test_offline_consumer_does_not_miss_deleted_days(participant, homes):
     got = [r.id for r in b.fetch_new()]
     assert got == [r.id for r in weekend]
     assert b.fetch_new() == []                     # 중복 없음
-    # 내용까지 읽힌다 (b 는 로컬 아카이브가 없다 → 히스토리에서 꺼낸다)
-    assert [r.payload["n"] for r in b.history(limit=6, fresh=False)] == list(range(6))
+    # ⭐ **전달된 레코드의 내용까지** 읽힌다. b 는 그 날짜의 로컬 아카이브가 없고
+    # 파일도 지워졌는데, 히스토리에서 꺼내기 때문이다 (`_record_from_history`).
+    assert [r.payload["n"] for r in b.fetch_new(advance=False)] == []
+    for rid in got:
+        assert b._read_record(rid, b._head()) is not None, rid
+
+    # ⚠️ 다만 **훑어보기**(history)에는 그 날이 아직 없다 — 라이브도 아니고 로컬
+    # 아카이브도 없기 때문이다. 그것을 메우는 것이 복구다.
+    day = day_of(weekend[0])
+    assert [r.id for r in b.history(fresh=False) if R.day_of(r.id) == day] == []
+    assert b.recover_archive(day)["added"] == 6
+    assert [
+        r.payload["n"] for r in b.history(fresh=False) if R.day_of(r.id) == day
+    ] == list(range(6))
 
 
 def test_first_time_consumer_sees_live_history(participant, homes):
@@ -430,6 +451,32 @@ def test_first_time_consumer_sees_live_history(participant, homes):
     # 아직 아무것도 지우지 않았다 → 새 소비자는 전부 본다
     c = participant("c", consumer="brandnew")
     assert [r.id for r in c.fetch_new()] == [r.id for r in old] + [live.id]
+
+
+def test_a_newcomer_after_a_drop_gets_the_past_by_recovering(participant, homes):
+    """⭐ 지워진 뒤에 **처음 합류한** 참가자는 무엇을 보는가 — 정직하게 못 박는다.
+
+    아카이브가 공유되지 않으므로, 갓 클론한 사람의 날짜 축에는 *살아 있는 날짜*만
+    있다. 그래서 첫 소비는 살아 있는 레코드만 준다. 지워진 과거는 **히스토리에
+    그대로 있고**, 빈 날짜를 훑어 복구하면(`archive_gaps` + `recover_archive` —
+    소비자의 기동 직후 1회 경로) 그 대화가 돌아온다.
+
+    ⚠️ 이 성질을 문서화하지 않으면 "과거가 조용히 사라졌다"로 읽힌다. 사라지지
+    않았고, 꺼내는 자리가 있다.
+    """
+    a = participant("a")
+    old = write_past(a, 2, [{"n": i} for i in range(5)])
+    live = a.append({"n": "today"}, flush=True)
+    day = day_of(old[0])
+    fold(a)
+
+    c = participant("c", consumer="brandnew")
+    assert [r.id for r in c.fetch_new()] == [live.id]      # 살아 있는 것만
+
+    for missing in c.archive_gaps(R.last_closed_day(c.clock.now(), 2.0), max_days=10):
+        c.recover_archive(missing)
+    assert sorted(c.archived_ids(day)) == sorted(r.id for r in old)
+    assert [r.id for r in c.history(fresh=False)] == [r.id for r in old] + [live.id]
 
 
 # ------------------------------------------- ⭐ 시계가 어긋난 *다른* 참가자
@@ -473,8 +520,8 @@ def test_late_record_reaches_a_consumer_after_the_second_drop(participant):
     b = participant("b")
     reader = participant("r", consumer="reader")
     old = write_past(a, 2, [{"n": i} for i in range(3)])
+    assert len(reader.fetch_new()) == 3     # 아직 살아 있을 때 받아 둔다
     fold(a)
-    assert len(reader.fetch_new()) == 3
 
     late = write_past(b, 2, [{"n": "late"}])[0]
     a.sync()
@@ -533,7 +580,7 @@ def test_drop_never_lands_on_a_moved_remote(participant):
     b = participant("b")
     write_past(a, 2, [{"n": i} for i in range(3)])
     b.sync()
-    b.archive_days()
+    assert b.archive_days()["archived"], "b 가 그 날짜를 못 봤다"
     base = b._remote_ref()
     day = sorted(b.archive_state())[0]
     commit = b._drop_commit(base, [(day, [])])
@@ -547,9 +594,14 @@ def test_drop_never_lands_on_a_moved_remote(participant):
     b.archive_days()
     res = b.drop_days([day])
     assert res["dropped"] is True and res["attempts"] >= 1
-    a.sync()
-    assert unseen.id in [r.id for r in a.history(fresh=False)]
+    # ⭐ 못 봤던 레코드가 b 의 로컬 아카이브에 **들어가 있다** (지우기 직전에 한
+    # 번 더 담기 때문이다) — 그래서 b 는 그것을 그대로 읽는다.
     assert unseen.id in b.archived_ids(day)
+    assert unseen.id in [r.id for r in b.history(fresh=False)]
+    # a 는 그 날짜를 옮기지 않았으므로 복구가 필요하다 (규약대로 히스토리에서).
+    a.sync()
+    assert a.recover_archive(day)["recovered"] is True
+    assert unseen.id in [r.id for r in a.history(fresh=False)]
 
 
 # --------------------------------------------------------------- ⭐ 자동 복구
@@ -764,8 +816,15 @@ def test_archive_reads_the_authoritative_blob_not_a_stale_worktree(participant):
         assert json.loads(lines[r.id])["payload"] == r.payload
 
 
-def test_corrupt_local_archive_falls_back_to_history(participant):
-    """로컬 아카이브가 깨졌으면 **히스토리에서** 꺼낸다 (조용히 없는 것이 되지 않는다)."""
+def test_corrupt_local_archive_is_loud_and_repairable(participant, caplog):
+    """로컬 아카이브가 깨지면 **조용히 없는 것이 되지 않는다** (로그 + 복구 가능).
+
+    삭제 뒤에는 로컬 아카이브가 그 날짜의 유일한 사본이므로, 깨진 파일은 그 날을
+    읽을 수 없게 만든다. 그 사실을 크게 남기고(`log.error`), 히스토리에서 다시
+    채울 수 있어야 한다 — 그것이 `recover_archive()` 다.
+    """
+    import logging
+
     a = participant("a")
     old = write_past(a, 2, [{"n": i} for i in range(4)])
     day = day_of(old[0])
@@ -773,8 +832,18 @@ def test_corrupt_local_archive_falls_back_to_history(participant):
     (a.clone_dir / R.archive_path(day)).write_bytes(b"corrupted\n")
     a._trees.clear()
     a._archive_memo = (None, {})
-    got = {r.id: r.payload for r in a.history(fresh=False)}
-    assert got == {r.id: r.payload for r in old}
+
+    with caplog.at_level(logging.ERROR, logger="gitwire"):
+        assert a.history(fresh=False) == []          # 읽히지 않는다 (사실이다)
+    assert any("읽을 수 없는 줄" in r.message for r in caplog.records), caplog.text
+
+    got = a.recover_archive(day)
+    assert got["added"] == 4 and got["problems"] == []
+    a._trees.clear()
+    a._archive_memo = (None, {})
+    assert {r.id: r.payload for r in a.history(fresh=False)} == {
+        r.id: r.payload for r in old
+    }
 
 
 def test_drop_commit_is_an_ordinary_fast_forward(participant):

@@ -1553,14 +1553,37 @@ class Channel:
         return sorted(out), clean
 
     def _archive_lines(self, day: str) -> dict[str, str]:
-        return _rollup.index_archive(self._archive_bytes(day))
+        """로컬 아카이브 한 날짜의 {id: 줄}. 해석 못 한 줄도 **버리지 않는다**.
+
+        id 를 못 읽은 줄은 합성 키로 남는다 (`rollup.index_archive`) — 다시 쓸 때
+        보존되어야 하므로. 다만 **조용히 넘기지는 않는다**: 그런 줄이 있으면 로그에
+        남긴다. 그 날짜가 이미 지워졌다면 그 줄이 유일한 사본일 수 있다.
+        """
+        lines = _rollup.index_archive(self._archive_bytes(day))
+        bad = [k for k in lines if not records.is_record_id(k)]
+        if bad:
+            log.error(
+                "gitwire: 로컬 아카이브 %s 에 레코드 id 를 읽을 수 없는 줄이 %d개 있다 "
+                "— 보존하되 조회 축에서는 빠진다. recover_archive(%r) 로 히스토리에서 "
+                "다시 채울 수 있다.",
+                day, len(bad), day,
+            )
+        return lines
 
     def _archive_ids(self, day: str, stamp: str) -> list[str]:
-        """아카이브에 든 레코드 id 목록 (오름차순). 스탬프로 캐시 → 재조회 0회."""
+        """아카이브에 든 레코드 id 목록 (오름차순). 스탬프로 캐시 → 재조회 0회.
+
+        ⚠️ **id 로 읽히는 줄만** 담는다. 조회 축에 정체불명의 키를 올리면 읽기가
+        매번 "없는 레코드"를 찾아 실패한다. 보존은 `_archive_lines` 의 일이다
+        (거기서는 한 줄도 버리지 않는다) — 두 책임을 갈라 둔다.
+        """
         key = f"aids:{day}:{stamp}"
         ids = self._trees.get(key)
         if ids is None:
-            ids = self._trees.put(key, sorted(self._archive_lines(day)))
+            ids = self._trees.put(
+                key,
+                sorted(k for k in self._archive_lines(day) if records.is_record_id(k)),
+            )
         return ids
 
     def _day_index(self, ref: str) -> list[tuple[str, str | None, str | None]]:
