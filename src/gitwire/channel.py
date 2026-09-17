@@ -1064,10 +1064,13 @@ class Channel:
           "곧바로 민다"의 구현이다). 이미 누가 밀고 있으면 기다리지 않는다.
           즉 최악의 대기 = push 한 번이고, 예전의 배칭 창처럼 *아무도 아무것도
           안 하는* 대기는 없다.
-        * 그 push 가 실패하면 **예외가 이 호출에서 올라온다** (조용히 삼키지
-          않는다 — 보냈다고 믿게 두지 않는다). 그래도 건은 대기열에 남고
-          배경 재시도가 계속 민다(`_retry_loop`). `autopublish=False` 면 이
-          호출은 절대 네트워크를 타지 않는다.
+        * 그 push 가 실패해도 **이 호출은 예외를 올리지 않는다** — 발행(대기열에
+          넣기)은 성공했고 전송만 못 한 것이기 때문이다. 대신 잃지 않는다:
+          건은 대기열에 남고(`_rewind`), 경고 로그가 남고, `info()["pending"]`
+          에 드러나고, 배경 재시도가 계속 민다(`_retry_loop`). 나갔는지 확인해야
+          하면 `ticket.wait(초)` 로 묻거나 `flush=True`(= 기다리겠다는 계약,
+          실패하면 예외)를 쓴다. `autopublish=False` 면 이 호출은 절대
+          네트워크를 타지 않는다.
         """
         with self._lock:
             self.open()
@@ -1231,7 +1234,32 @@ class Channel:
                     #  진척 없음으로 오판해 쓸데없이 재시도로 넘긴다.)
                     was = self._queue[0].seq if self._queue else None
                     states = len(self._pending_state)
-                self.flush()
+                try:
+                    self.flush()
+                except Exception as exc:
+                    # ⚠️ **기다리라고 한 쪽에만 예외를 준다.**
+                    #
+                    # `flush=True`·`flush()` 는 "이번 건이 나갈 때까지 기다린다"는
+                    # 계약이므로 실패를 숨기면 거짓말이 된다 → 올린다.
+                    #
+                    # 반면 `append()`(기다리지 않는 쪽)에서 전송 실패를 예외로
+                    # 올리면 **발행 자체가 실패한 것으로 보인다** — 소비자는 그걸
+                    # "보낼 수 없었다"로 사용자에게 말하고, 그 뒤 배경 재시도가
+                    # 조용히 성공해서 "실패했다더니 나갔다"가 된다 (실측: gitwire-chat
+                    # 의 send 는 append 예외를 RoomError 로 바꾼다). 그래서 이쪽은
+                    # 예외를 올리지 않고, 대신 **잃지 않는다**: 대기열에 그대로 남고
+                    # (`_rewind`), 로그를 남기고, `info()["pending"]` 에 드러나고,
+                    # 배경 재시도가 계속 민다(`finally` → `_arm_retry`).
+                    if wait_for is not None:
+                        raise
+                    log.warning(
+                        "gitwire: 발행 실패 — 대기열에 남기고 배경에서 다시 민다 "
+                        "(대기 %d건): %s",
+                        len(self._queue),
+                        exc,
+                        exc_info=True,
+                    )
+                    return
                 with self._lock:
                     now = self._queue[0].seq if self._queue else None
                     if now == was and len(self._pending_state) >= states:

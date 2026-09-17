@@ -202,15 +202,21 @@ def test_records_appended_during_push_are_not_lost(participant, bare_repo, homes
     assert len(got) == len(set(got))
 
 
-def test_a_failed_publish_is_loud_and_keeps_retrying(participant, bare_repo, homes):
-    """밀 수 없었던 건은 **조용히 사라지지 않는다.**
+def test_a_failed_publish_keeps_retrying_without_lying(participant, bare_repo, homes, caplog):
+    """밀 수 없었던 건은 **조용히 사라지지도, 실패했다고 거짓말하지도 않는다.**
 
-    두 가지를 함께 못 박는다:
+    네 가지를 함께 못 박는다:
 
-    1. 실패는 **부른 쪽에 예외로** 올라간다 (드레인이 삼키지 않는다).
-    2. 그래도 대기열에 남아 **배경이 계속 다시 민다** — 아무도 다음 건을
-       발행하지 않아도 원격이 돌아오는 순간 나간다. 그 재시도 간격이 이
-       설계에 남은 유일한 타이머다(배칭 창이 아니다).
+    1. `append()` 는 전송 실패로 **예외를 올리지 않는다.** 발행(대기열에 넣기)은
+       성공했고 전송만 못 한 것이다 — 여기서 예외를 올리면 소비자가 그것을
+       "보낼 수 없었다"로 사용자에게 말하고, 그 뒤 배경 재시도가 성공해서
+       **"실패했다더니 나갔다"** 가 된다 (gitwire-chat 의 send 는 append 예외를
+       RoomError 로 바꾼다).
+    2. 그래도 **조용하지 않다** — 경고 로그가 남고 `info()["pending"]` 에 드러난다.
+    3. 대기열에 남아 **배경이 계속 다시 민다** — 아무도 다음 건을 발행하지 않아도
+       원격이 돌아오는 순간 나간다. 그 재시도 간격이 이 설계에 남은 유일한
+       타이머다(배칭 창이 아니다).
+    4. 반대로 **기다리라고 한 쪽**(`flush()`)에는 실패를 그대로 올린다.
 
     그리고 그 상태에서 `close()` 가 교착 없이 끝난다.
     """
@@ -220,9 +226,15 @@ def test_a_failed_publish_is_loud_and_keeps_retrying(participant, bare_repo, hom
     a = participant("a", runner=runner)                # autopublish = 기본
     runner.blocked = True                              # 방이 만들어진 뒤에 막는다
 
-    with pytest.raises(gitwire.GitError):
-        a.append({"n": "지금은 못 나갈 말"})
+    with caplog.at_level("WARNING", logger="gitwire"):
+        a.append({"n": "지금은 못 나갈 말"})           # 예외 없음
     assert a.info()["pending"] == 1, "대기열에 남아 있지 않다"
+    assert any("발행 실패" in r.message for r in caplog.records), caplog.text
+
+    # 기다리라고 한 쪽에는 그대로 올린다
+    with pytest.raises(gitwire.GitError):
+        a.flush(push_attempts=1)
+    assert a.info()["pending"] == 1
 
     runner.blocked = False                             # 원격이 돌아왔다
     deadline = time.monotonic() + 60
