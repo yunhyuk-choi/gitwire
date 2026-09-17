@@ -86,7 +86,7 @@ def test_unpushed_work_survives_a_rewrite(participant):
     대기열 쪽은 "재작성 뒤에도 그대로 나가는가"가 관심사다. 둘을 함께 본다.
     """
     a = participant("alice")
-    b = participant("bob", batch_window=60.0)  # push 를 늦춘다
+    b = participant("bob", autopublish=False)  # 쌓아 두고 수동으로만 민다
     a.append({"who": "alice"}, flush=True)
 
     b.write_state("bob@localhost", {"cursor": "c1"})
@@ -107,7 +107,7 @@ def test_unpushed_work_survives_a_rewrite(participant):
 def test_rewrite_without_recovery_marker_refuses_to_destroy(participant):
     """되살릴 근거가 없으면 조용히 버리지 않고 예외를 올린다."""
     a = participant("alice")
-    b = participant("bob", batch_window=60.0)
+    b = participant("bob", autopublish=False)
     a.append({"i": 0}, flush=True)
     b.fetch_new()
 
@@ -144,7 +144,7 @@ def second_bare(tmp_path):
 def test_hub_handles_several_channels(bare_repo, second_bare, tmp_path):
     """채널 = 레포 = 클론. 여러 개를 동시에 다룬다."""
     with gitwire.Hub(
-        home=tmp_path / "hubhome", clock=FixedOffsetClock(0.0), batch_window=0.0
+        home=tmp_path / "hubhome", clock=FixedOffsetClock(0.0)
     ) as hub:
         room1 = hub.open(str(bare_repo))
         room2 = hub.open(str(second_bare))
@@ -158,7 +158,7 @@ def test_hub_handles_several_channels(bare_repo, second_bare, tmp_path):
         assert hub.open(str(bare_repo)) is room1
 
     with gitwire.Hub(
-        home=tmp_path / "readerhome", clock=FixedOffsetClock(0.0), batch_window=0.0
+        home=tmp_path / "readerhome", clock=FixedOffsetClock(0.0)
     ) as reader:
         reader.open(str(bare_repo))
         reader.open(str(second_bare))

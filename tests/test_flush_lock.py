@@ -66,7 +66,7 @@ def landed(bare_repo, homes, name="verify", *, recover=()) -> list[str]:
 def test_push_does_not_block_append_or_reads(participant, capsys):
     """push 가 도는 동안 `append()` 와 읽기가 계속 돌아간다 (시간으로 증명)."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     a.append({"n": "seed"})
 
     pushing = threading.Thread(target=a.flush, daemon=True)
@@ -97,7 +97,7 @@ def test_push_does_not_block_append_or_reads(participant, capsys):
 def test_flush_still_serializes_pushes(participant):
     """빨라졌다고 push 가 겹치지는 않는다 (`_remote` 가 직렬화한다)."""
     runner = SlowPushRunner(0.4)
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     overlap = []
     live = []
     orig = runner.run
@@ -130,7 +130,7 @@ def test_flush_still_serializes_pushes(participant):
 def test_records_appended_during_push_are_not_lost(participant, bare_repo, homes):
     """push 도중에 들어온 레코드가 전부, 한 번씩, 순서대로 원격에 착지한다."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     first = a.append({"n": "first"})
 
     pushing = threading.Thread(target=a.flush, daemon=True)
@@ -159,7 +159,7 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
     대기열(메모리)에 있다가 `flush()` 안에서만 커밋된다. 그래서 그 경로로 잰다.
     """
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     a.append({"n": 0})
     a.flush()
     pushed = a.git.out("rev-parse", "refs/gitwire/pushed")
@@ -176,8 +176,8 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
 
 def test_concurrent_participants_do_not_lose_records(participant, bare_repo, homes):
     """두 참가자가 동시에 느린 push 를 해도(선점 → rebase 재시도) 유실이 없다."""
-    a = participant("a", runner=SlowPushRunner(0.3), batch_window=3600.0)
-    b = participant("b", runner=SlowPushRunner(0.3), batch_window=3600.0)
+    a = participant("a", runner=SlowPushRunner(0.3), autopublish=False)
+    b = participant("b", runner=SlowPushRunner(0.3), autopublish=False)
     made = []
     barrier = threading.Barrier(2)
 
@@ -203,8 +203,8 @@ def test_concurrent_participants_do_not_lose_records(participant, bare_repo, hom
 def test_sync_does_not_interleave_with_a_running_push(participant, bare_repo, homes):
     """push 중에 `sync()` 가 끼어들어 방금 올린 커밋을 갈아치우지 않는다."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
-    b = participant("b", batch_window=0.0)
+    a = participant("a", runner=runner, autopublish=False)
+    b = participant("b")
     mine = [a.append({"n": i}) for i in range(3)]
     theirs = b.append({"n": "b"})          # 원격이 앞서 있다 → a 의 push 는 거부된다
 
@@ -228,7 +228,7 @@ def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes
     """아카이빙·삭제(로컬을 크게 바꾼다)와 발행·flush 가 겹쳐도 유실·중복이 없다."""
     from test_archive import day_of, write_past   # noqa: PLC0415
 
-    a = participant("a", batch_window=3600.0)
+    a = participant("a", autopublish=False)
     old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(6)])
     day = day_of(old[0])
 
@@ -274,9 +274,13 @@ def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes
     assert {r.id for r in a.history(fresh=True)} == {r.id for r in made}
 
 
-def test_compact_does_not_deadlock_with_a_running_flusher(participant, bare_repo, homes):
-    """`compact()` 는 `_remote` → `_lock` 순서를 지킨다 (교착이 없다)."""
-    a = participant("a", batch_window=0.05)
+def test_compact_does_not_deadlock_with_a_running_publisher(participant, bare_repo, homes):
+    """`compact()` 는 `_remote` → `_lock` 순서를 지킨다 (교착이 없다).
+
+    ⭐ 발행이 **계속 돌고 있는 동안** compact 를 부른다 (드레인 루프는 append
+    마다 곧바로 밀기 때문에, 창을 짧게 잡던 예전 설정이 그대로 기본 동작이다).
+    """
+    a = participant("a")
     recs = [a.append({"n": i}) for i in range(5)]
     a.flush()
     done = {}
@@ -297,7 +301,7 @@ def test_compact_does_not_deadlock_with_a_running_flusher(participant, bare_repo
 
 
 def test_close_flushes_without_deadlock(participant, bare_repo, homes):
-    a = participant("a", runner=SlowPushRunner(0.3), batch_window=3600.0)
+    a = participant("a", runner=SlowPushRunner(0.3), autopublish=False)
     recs = [a.append({"n": i}) for i in range(3)]
     a.close()
     assert sorted(landed(bare_repo, homes)) == sorted(r.id for r in recs)

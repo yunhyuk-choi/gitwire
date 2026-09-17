@@ -34,13 +34,27 @@ def past(days: float) -> FixedOffsetClock:
 
 
 def write_past(ch: gitwire.Channel, days: float, payloads):
-    """days 일 전 시각으로 레코드를 발행한다. 발행한 Record 목록."""
-    real = ch.clock
+    """days 일 전 시각으로 레코드를 **배치 발행**한다. 발행한 티켓 목록.
+
+    ⚠️ 건마다 push 하지 않는다. 이 헬퍼를 쓰는 테스트의 관심사는 "그 날짜에
+    레코드가 있다"이지 커밋 개수가 아닌데, 건마다 밀면 160건짜리 셋업(40건 × 4일)
+    이 160 push 가 되어 셋업만 수십 분이다. 그래서 전부 대기열에 넣고 한 번에
+    민다 — `autopublish` 를 잠시 끄는 것이 곧 "배치 발행"이다.
+    """
+    real, auto = ch.clock, ch.autopublish
     ch.clock = past(days)
+    ch.autopublish = False
     try:
-        return [ch.append(p, flush=True) for p in payloads]
+        tickets = [ch.append(p) for p in payloads]
+        while True:
+            left = ch.info()["pending"]
+            if not left:
+                break
+            ch.flush()
+            assert ch.info()["pending"] < left, "발행이 진척되지 않았다"
+        return tickets
     finally:
-        ch.clock = real
+        ch.clock, ch.autopublish = real, auto
 
 
 def day_of(rec) -> str:
@@ -193,8 +207,7 @@ def test_existing_channel_gets_the_gitignore_without_touching_tracked_files(
     """
     first = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="a",
-        clock=FixedOffsetClock(0.0), batch_window=0.0,
-    ).open()
+        clock=FixedOffsetClock(0.0), ).open()
     try:
         first.git.run("rm", "-q", "--", ".gitignore")
         # 옛 세계의 잔재: 추적되는 아카이브 파일
@@ -209,8 +222,7 @@ def test_existing_channel_gets_the_gitignore_without_touching_tracked_files(
 
     second = gitwire.Channel(
         str(bare_repo), home=homes("b"), sender="b",
-        clock=FixedOffsetClock(0.0), batch_window=0.0,
-    ).open()
+        clock=FixedOffsetClock(0.0), ).open()
     try:
         assert ".gitignore" in tree_paths(second)
         body = second.git.out("show", "HEAD:.gitignore")
@@ -704,7 +716,7 @@ def test_archive_gaps_finds_missing_days(participant):
 
 def test_archiving_does_not_block_reads_and_writes(participant, capsys):
     """⭐ 아카이빙이 도는 동안 읽기·쓰기가 막히지 않는다 (시간으로 증명)."""
-    a = participant("a", batch_window=3600.0)
+    a = participant("a", autopublish=False)
     for d in (5, 4, 3, 2):
         write_past(a, d, [{"n": f"{d}-{i}"} for i in range(40)])
     reader = participant("r", consumer="reader")
@@ -871,7 +883,7 @@ def test_drop_commit_is_an_ordinary_fast_forward(participant):
 
 def test_queued_records_are_flushed_before_drop(participant):
     """삭제는 대기열을 먼저 밀어낸다 — 뒤에 남겨두고 지우지 않는다."""
-    a = participant("a", batch_window=3600.0)
+    a = participant("a", autopublish=False)
     old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(3)])
     arch = a.archive_days()
     queued = a.append({"n": "대기열"})
@@ -904,7 +916,7 @@ def test_cli_archive_and_drop(bare_repo, homes, cli_env):
     home = homes("cli")
     ch = gitwire.Channel(
         str(bare_repo), home=home, sender="cli", clock=FixedOffsetClock(0.0),
-        batch_window=0.0, auto_archive=False,
+        auto_archive=False,
     ).open()
     old = write_past(ch, 2, [{"n": i} for i in range(4)])
     ch.close()
@@ -940,7 +952,7 @@ def test_cli_recover_archive(bare_repo, homes, cli_env):
 
     a = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="a", clock=FixedOffsetClock(0.0),
-        batch_window=0.0, auto_archive=False,
+        auto_archive=False,
     ).open()
     old = write_past(a, 2, [{"n": i} for i in range(3)])
     day = day_of(old[0])
@@ -951,7 +963,7 @@ def test_cli_recover_archive(bare_repo, homes, cli_env):
     home = homes("b")
     b = gitwire.Channel(
         str(bare_repo), home=home, sender="b", clock=FixedOffsetClock(0.0),
-        batch_window=0.0, auto_archive=False,
+        auto_archive=False,
     ).open()
     b.sync()
     assert day not in b.archive_state()
@@ -965,7 +977,7 @@ def test_cli_recover_archive(bare_repo, homes, cli_env):
 
     b2 = gitwire.Channel(
         str(bare_repo), home=home, sender="b", clock=FixedOffsetClock(0.0),
-        batch_window=0.0, auto_archive=False,
+        auto_archive=False,
     ).open()
     try:
         assert b2.archived_ids(day) == sorted(r.id for r in old)

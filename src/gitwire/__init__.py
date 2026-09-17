@@ -37,9 +37,9 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
 """
 
 from .channel import (
-    DEFAULT_BATCH_WINDOW,
     DEFAULT_BRANCH,
     DEFAULT_CREDENTIAL_CACHE_TIMEOUT,
+    DEFAULT_MAX_BATCH,
     DEFAULT_PAGE,
     DEFAULT_POLL_INTERVAL,
     DEFAULT_ARCHIVE_INTERVAL,
@@ -153,7 +153,7 @@ __all__ = [
     # 기본값
     "DEFAULT_BRANCH",
     "DEFAULT_POLL_INTERVAL",
-    "DEFAULT_BATCH_WINDOW",
     "DEFAULT_PAGE",
     "DEFAULT_CREDENTIAL_CACHE_TIMEOUT",
+    "DEFAULT_MAX_BATCH",
 ]

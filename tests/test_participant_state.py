@@ -123,7 +123,7 @@ def test_상태가_원격까지_간다(bare_repo, participant):
 
 def test_레코드와_상태가_한_커밋으로_나간다(bare_repo, participant):
     """부수 상태의 발행이 메시지 전송보다 앞서 끼어들지 않는다 — 같이 실려 간다."""
-    alice = participant("alice", batch_window=5.0)
+    alice = participant("alice", autopublish=False)
     ticket = alice.append({"i": 1})
     # ⚠️ 커서 값으로 `ticket.id` 를 쓸 수 없다 — 아직 없다(push 때 정해진다).
     # 이 테스트의 관심사는 *둘이 한 커밋으로 나가는가*이므로 값은 무엇이든 좋다.
@@ -150,7 +150,7 @@ def test_있음_판정은_git_을_부르지_않는다(bare_repo, homes):
     runner = CountingRunner()
     ch = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="alice", runner=runner,
-        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
+        clock=FixedOffsetClock(0.0), auto_archive=False,
     ).open()
     try:
         runner.reset()
@@ -302,7 +302,7 @@ def test_한_사람_두_기기가_같은_경로를_써도_push_가_깨지지_않
     def open_device(name: str):
         return gitwire.Channel(
             str(bare_repo), home=homes(name), sender=name,
-            clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
+            clock=FixedOffsetClock(0.0), auto_archive=False,
         ).open()
 
     laptop = open_device("laptop")
@@ -420,7 +420,7 @@ def test_같은_커밋을_되풀이해_읽으면_git_을_부르지_않는다(bar
     runner = CountingRunner()
     reader = gitwire.Channel(
         str(bare_repo), home=homes("r"), sender="bob", runner=runner,
-        clock=FixedOffsetClock(0.0), batch_window=0.0, auto_archive=False,
+        clock=FixedOffsetClock(0.0), auto_archive=False,
     ).open()
     try:
         reader.sync()

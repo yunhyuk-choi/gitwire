@@ -92,7 +92,6 @@ def _channel(args: argparse.Namespace) -> Channel:
         branch=args.branch,
         home=Path(args.home) if args.home else None,
         depth=args.depth,
-        batch_window=0.0,  # CLI 는 일회성 호출이 기본 → 즉시 커밋·push
         name=getattr(args, "name", None),
     )
 
@@ -222,7 +221,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
     """상시 구독을 NDJSON 스트림으로 흘린다 (tail 처럼 쓰는 소비자용)."""
     seen = 0
     with _channel(args) as ch:
-        ch.batch_window = 0.0
 
         def on_rec(rec) -> None:
             nonlocal seen

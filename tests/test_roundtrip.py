@@ -181,8 +181,7 @@ def test_restart_no_duplicate_no_loss(bare_repo, homes, participant):
     def open_bob():
         return gitwire.Channel(
             str(bare_repo), home=bob_home, sender="bob",
-            clock=FixedOffsetClock(0.0), batch_window=0.0,
-        ).open()
+            clock=FixedOffsetClock(0.0), ).open()
 
     # 1회차 프로세스: 3건만 가져가고 죽는다
     b1 = open_bob()
@@ -219,8 +218,7 @@ def test_crash_mid_batch_resumes_exactly(bare_repo, homes, participant):
     def open_bob():
         return gitwire.Channel(
             str(bare_repo), home=bob_home, sender="bob",
-            clock=FixedOffsetClock(0.0), batch_window=0.0,
-        ).open()
+            clock=FixedOffsetClock(0.0), ).open()
 
     seen: list[int] = []
 
@@ -252,9 +250,9 @@ def test_per_consumer_cursor_isolation(bare_repo, homes, participant):
 
     home = homes("shared")
     web = gitwire.Channel(str(bare_repo), home=home, consumer="webapp",
-                          clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+                          clock=FixedOffsetClock(0.0)).open()
     bot = gitwire.Channel(str(bare_repo), home=home, consumer="agent",
-                          clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+                          clock=FixedOffsetClock(0.0)).open()
 
     assert len(web.fetch_new()) == 3
     assert web.fetch_new() == []
@@ -267,7 +265,8 @@ def test_per_consumer_cursor_isolation(bare_repo, homes, participant):
 
 
 def test_batching_groups_into_one_commit(participant):
-    a = participant("alice", batch_window=60.0)  # 창을 길게 → 수동 flush 로 한 커밋
+    # autopublish=False → 쌓아 두고 수동 flush 로 한 커밋
+    a = participant("alice", autopublish=False)
     before = commit_count(a.clone_dir)
     for i in range(10):
         a.append({"i": i})
@@ -279,16 +278,26 @@ def test_batching_groups_into_one_commit(participant):
     assert len(b.fetch_new()) == 10
 
 
-def test_no_batching_commit_per_record(participant):
-    a = participant("alice", batch_window=0.0)
+def test_drain_publishes_each_send_on_its_own_when_idle(participant):
+    """비어 있는 파이프에 연속 3건 → **기다리지 않고** 각자 나간다 (창이 없다).
+
+    예전에는 `batch_window=0` 이 이 동작을 강제했다. 드레인 루프에서는 그것이
+    기본이다 — 부르는 쪽이 그 자리에서 밀고, 밀 것이 남아 있지 않으면 멈춘다.
+    """
+    a = participant("alice")
     before = commit_count(a.clone_dir)
     for i in range(3):
         a.append({"i": i})
     assert commit_count(a.clone_dir) - before == 3
 
 
-def test_batch_window_autoflush(participant):
-    a = participant("alice", batch_window=0.2)
+def test_append_publishes_without_a_manual_flush(participant):
+    """`flush()` 를 부르지 않아도 나간다 — 예전의 「배칭 플러셔」가 하던 몫.
+
+    ⭐ 다른 것은 **기다리는 시간이 없다**는 점뿐이다. 그래서 첫 조회에서 이미
+    둘 다 보여야 한다(관대한 재시도 루프는 느린 러너 대비로만 남긴다).
+    """
+    a = participant("alice")
     b = participant("bob")
     a.append({"x": 1})
     a.append({"x": 2})
@@ -302,7 +311,8 @@ def test_batch_window_autoflush(participant):
         if len(got) >= 2:
             break
         time.sleep(0.2)
-    assert len(got) == 2, "배칭 플러셔가 자동으로 push 하지 않았다"
+    assert len(got) == 2, "발행이 자동으로 push 되지 않았다"
+    assert time.monotonic() - start < 5.0, "창이 사라졌는데도 기다렸다"
 
 
 # ------------------------------------------------------------- 5. 변경 감지
@@ -387,8 +397,7 @@ def test_shallow_clone_works(bare_repo, homes, participant):
 
     shallow = gitwire.Channel(
         str(bare_repo), home=homes("shallow"), depth=1,
-        clock=FixedOffsetClock(0.0), batch_window=0.0,
-    ).open()
+        clock=FixedOffsetClock(0.0), ).open()
     try:
         assert len(shallow.fetch_new()) == 5
         a.append({"i": 5}, flush=True)
@@ -433,7 +442,7 @@ def test_refuses_to_turn_a_repo_with_content_into_a_channel(bare_repo, tmp_path,
 
     with pytest.raises(gitwire.ChannelInitError) as caught:
         gitwire.Channel(str(bare_repo), home=homes("careless"), sender="oops",
-                        clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+                        clock=FixedOffsetClock(0.0)).open()
     assert "빈 레포" in str(caught.value)
 
     # ⭐ 지상검증 — 원격이 **한 글자도** 바뀌지 않았다.
@@ -455,7 +464,7 @@ def test_still_initializes_a_fresh_repo_with_readme_and_license(bare_repo, tmp_p
         "README.md": "# our-room\n", "LICENSE": "MIT\n", ".gitignore": "*.pyc\n",
     })
     channel = gitwire.Channel(str(bare_repo), home=homes("fresh"), sender="alice",
-                              clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+                              clock=FixedOffsetClock(0.0)).open()
     try:
         assert (channel.clone_dir / "gitwire.json").exists()
         rec = channel.append({"n": 1}, flush=True)
@@ -476,7 +485,7 @@ def test_existing_channel_still_opens(bare_repo, homes, participant):
     first = participant("alice")
     first.append({"n": 1}, flush=True)
     second = gitwire.Channel(str(bare_repo), home=homes("second"), sender="bob",
-                             clock=FixedOffsetClock(0.0), batch_window=0.0).open()
+                             clock=FixedOffsetClock(0.0)).open()
     try:
         assert [r.payload["n"] for r in second.history()] == [1]
     finally:

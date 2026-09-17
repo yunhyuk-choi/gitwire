@@ -81,7 +81,6 @@ def participant(bare_repo, homes):
         kwargs.setdefault("home", homes(name))
         kwargs.setdefault("sender", name)
         kwargs.setdefault("clock", FixedOffsetClock(0.0))
-        kwargs.setdefault("batch_window", 0.0)
         ch = gitwire.Channel(str(bare_repo), **kwargs).open()
         opened.append(ch)
         return ch
