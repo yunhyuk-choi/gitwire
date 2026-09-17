@@ -181,7 +181,8 @@ def test_restart_no_duplicate_no_loss(bare_repo, homes, participant):
     def open_bob():
         return gitwire.Channel(
             str(bare_repo), home=bob_home, sender="bob",
-            clock=FixedOffsetClock(0.0), ).open()
+            clock=FixedOffsetClock(0.0),
+        ).open()
 
     # 1회차 프로세스: 3건만 가져가고 죽는다
     b1 = open_bob()
@@ -218,7 +219,8 @@ def test_crash_mid_batch_resumes_exactly(bare_repo, homes, participant):
     def open_bob():
         return gitwire.Channel(
             str(bare_repo), home=bob_home, sender="bob",
-            clock=FixedOffsetClock(0.0), ).open()
+            clock=FixedOffsetClock(0.0),
+        ).open()
 
     seen: list[int] = []
 
@@ -397,7 +399,8 @@ def test_shallow_clone_works(bare_repo, homes, participant):
 
     shallow = gitwire.Channel(
         str(bare_repo), home=homes("shallow"), depth=1,
-        clock=FixedOffsetClock(0.0), ).open()
+        clock=FixedOffsetClock(0.0),
+    ).open()
     try:
         assert len(shallow.fetch_new()) == 5
         a.append({"i": 5}, flush=True)

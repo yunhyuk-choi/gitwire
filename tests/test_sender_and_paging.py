@@ -144,7 +144,8 @@ def participant_channel(bare_repo, home, sender="alice"):
     """픽스처를 거치지 않고 채널 하나를 연다 (runner 를 갈아끼울 때 쓴다)."""
     return gitwire.Channel(
         str(bare_repo), home=home, sender=sender,
-        clock=FixedOffsetClock(0.0), ).open()
+        clock=FixedOffsetClock(0.0),
+    ).open()
 
 
 def _fill(channel, count, start=None, step=None):

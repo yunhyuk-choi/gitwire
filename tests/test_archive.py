@@ -207,7 +207,8 @@ def test_existing_channel_gets_the_gitignore_without_touching_tracked_files(
     """
     first = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="a",
-        clock=FixedOffsetClock(0.0), ).open()
+        clock=FixedOffsetClock(0.0),
+    ).open()
     try:
         first.git.run("rm", "-q", "--", ".gitignore")
         # 옛 세계의 잔재: 추적되는 아카이브 파일
@@ -222,7 +223,8 @@ def test_existing_channel_gets_the_gitignore_without_touching_tracked_files(
 
     second = gitwire.Channel(
         str(bare_repo), home=homes("b"), sender="b",
-        clock=FixedOffsetClock(0.0), ).open()
+        clock=FixedOffsetClock(0.0),
+    ).open()
     try:
         assert ".gitignore" in tree_paths(second)
         body = second.git.out("show", "HEAD:.gitignore")
