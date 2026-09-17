@@ -1315,16 +1315,24 @@ class Channel:
                     continue
             if self._closing.wait(delay):
                 return
+            # ⚠️ 진척을 **예외로 판정하지 않는다** — `_drain()` 은 기다리지 않는
+            # 쪽이라 실패를 예외로 올리지 않기 때문이다(`_drain` 도크). 그래서
+            # 남은 양으로 본다: 줄었으면 백오프를 되돌리고, 그대로면 늘린다.
+            # (그러지 않으면 계속 실패하는 원격을 0.5초마다 두드린다.)
+            before = len(self._queue) + len(self._pending_state)
             try:
                 self._drain()
+            except Exception:                      # pragma: no cover - 방어
+                log.warning("gitwire: 발행 재시도가 예외로 끝났다", exc_info=True)
+            left = len(self._queue) + len(self._pending_state)
+            if left < before:
                 delay = RETRY_DELAY_MIN
-            except Exception:
+            else:
                 delay = min(delay * 2, RETRY_DELAY_MAX)
-                log.warning(
-                    "gitwire: 발행 재시도 실패 — %.1f초 뒤 다시 시도한다 (대기 %d건)",
+                log.info(
+                    "gitwire: 아직 밀지 못했다 — %.1f초 뒤 다시 시도한다 (대기 %d건)",
                     delay,
-                    len(self._queue),
-                    exc_info=True,
+                    left,
                 )
 
     def flush(self, push_attempts: int = DEFAULT_PUSH_ATTEMPTS) -> list[records.Record]:
