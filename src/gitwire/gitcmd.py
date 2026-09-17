@@ -195,6 +195,16 @@ def credential_config(git_path: str = "git") -> tuple[str, ...]:
     return args
 
 
+def reset_credential_state() -> None:
+    """탐지·접힘 기록을 비운다. **프로세스 안의 캐시를 지우는 것뿐이다.**
+
+    한 프로세스 안에서 환경을 바꿔 가며 확인하는 쪽(테스트·진단)이 쓴다.
+    """
+    with _cred_lock:
+        _cred_cache.clear()
+        _cred_disabled.clear()
+
+
 def disable_credential_config(git_path: str, reason: str) -> None:
     """지정한 헬퍼로 인증이 안 됐다 — 이 프로세스에서는 접고 사용자 설정을 쓴다.
 

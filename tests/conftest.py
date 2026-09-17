@@ -19,6 +19,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import gitwire  # noqa: E402
+from gitwire import gitcmd  # noqa: E402
 from gitwire.clock import FixedOffsetClock  # noqa: E402
 
 
@@ -28,6 +29,18 @@ def git(*args: str, cwd: Path) -> str:
         encoding="utf-8", errors="replace", check=True
     )
     return proc.stdout
+
+
+@pytest.fixture(autouse=True)
+def _reset_credential_detection():
+    """`gitcmd` 의 자격증명 헬퍼 탐지·접힘 기록은 **프로세스 전역**이다.
+
+    한 테스트에서 인증 실패를 흉내내면 그 뒤 테스트는 "접힌" 상태로 돌아
+    조용히 다른 것을 재게 된다. 그래서 매 테스트 앞뒤로 비운다.
+    """
+    gitcmd.reset_credential_state()
+    yield
+    gitcmd.reset_credential_state()
 
 
 @pytest.fixture(autouse=True)

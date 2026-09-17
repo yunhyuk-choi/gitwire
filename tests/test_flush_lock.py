@@ -94,6 +94,57 @@ def test_push_does_not_block_append_or_reads(participant, capsys):
     assert max(reads) < runner.delay * 1000 * 0.5, reads
 
 
+def test_sends_during_a_push_ride_one_commit(participant, bare_repo, homes):
+    """⭐ 창이 없어도 묶인다 — push 가 **도는 동안** 들어온 3건이 한 커밋으로 나간다.
+
+    드레인 루프의 요점이 이 하나다. 대기열이 비어 있으면 부르는 쪽이 그 자리에서
+    밀고(그래서 조용한 방의 한 건은 기다리지 않는다), 미는 동안 들어온 것들은
+    쌓여서 **다음 회차에 한 커밋으로** 나간다. 묶음 크기가 부하에 맞춰 저절로
+    정해지므로 조율할 숫자가 없다.
+
+    ⚠️ "미는 동안"을 만들려면 첫 건을 **다른 스레드**에서 보내야 한다 — 한
+    스레드에서 연달아 보내면 각 건이 자기 push 를 기다렸다 나가고, 그건 묶임이
+    아니라 정상 동작이다(창이 없으니 미룰 이유가 없다).
+    """
+    runner = SlowPushRunner(1.0)
+    a = participant("a", runner=runner)              # autopublish = 기본(켜짐)
+    before = int(a.git.out("rev-list", "--count", "HEAD"))
+    box: dict = {}
+
+    def send_first():
+        box["t"] = a.append({"n": "first"})          # 이 호출이 push 를 돌린다
+
+    runner.started.clear()                           # 방 초기화 push 는 제외
+    th = threading.Thread(target=send_first, daemon=True)
+    th.start()
+    assert runner.started.wait(10), "push 가 시작되지 않았다"
+
+    took = []
+    during = []
+    for i in range(3):
+        t0 = time.perf_counter()
+        during.append(a.append({"n": i}))            # 미는 동안 들어온다
+        took.append((time.perf_counter() - t0) * 1000)
+    th.join(30)
+    assert not th.is_alive()
+    for t in [box["t"], *during]:
+        assert t.wait(30) is not None, "안 나갔다"
+
+    after = int(a.git.out("rev-list", "--count", "HEAD"))
+    assert after - before == 2, (
+        f"커밋 {after - before}개 — 1건 + 3건(한 커밋) = 2 여야 한다"
+    )
+    print(f"\n[drain] push={runner.delay*1000:.0f}ms  "
+          f"미는 동안 append max={max(took):.1f}ms  커밋={after - before}개")
+    # 미는 동안의 발행은 그 push 를 기다리지 않는다
+    assert max(took) < runner.delay * 1000 * 0.8, took
+    # 유실·중복 없음 + id 는 발행 순서대로
+    got = landed(bare_repo, homes)
+    expect = [t.id for t in [box["t"], *during]]
+    assert got == sorted(expect)
+    assert len(got) == len(set(got))
+
+
 def test_flush_still_serializes_pushes(participant):
     """빨라졌다고 push 가 겹치지는 않는다 (`_remote` 가 직렬화한다)."""
     runner = SlowPushRunner(0.4)
