@@ -52,6 +52,17 @@ class HistoryRewritten(GitwireError):
     exit_code = 6
 
 
+class NotPushed(GitwireError):
+    """아직 원격에 나가지 않은 레코드의 id·시각을 물었다.
+
+    레코드의 시각과 id 는 **원격에 push 되는 순간**에 정해진다 — 작성 시각이
+    아니다 (`Channel.append` 도크). 그래서 대기열에 있는 동안은 물어도 답이
+    없다. `PendingRecord.wait()` 로 기다리거나 `flush()` 로 밀어라.
+    """
+
+    exit_code = 8
+
+
 class ClockError(GitwireError):
     """공통 시계 보정에 실패했다 (치명적이지 않음 — 보통 경고로 흡수)."""
 

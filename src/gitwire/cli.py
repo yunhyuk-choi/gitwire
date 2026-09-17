@@ -187,10 +187,17 @@ def cmd_history(args: argparse.Namespace) -> int:
 
 
 def cmd_append(args: argparse.Namespace) -> int:
+    """발행 — **항상 push 까지** 한다.
+
+    ⚠️ 예전의 `--no-push`(로컬에만 쓰기)를 없앴다. 레코드의 시각·id 는 push 되는
+    순간에 정해지고 대기열은 메모리이므로, 밀지 않고 프로세스가 끝나면 그 레코드는
+    **그냥 사라진다.** "로컬에만 써 둔다"가 성립하지 않는 것이라 옵션으로 둘 수
+    없다 (`Channel.append` 도크).
+    """
     payload = _load_payload(args)
     with _channel(args) as ch:
-        # append() 는 이제 Record 를 준다 — ID 에서 시각을 되파싱할 필요가 없다.
-        rec = ch.append(payload, flush=not args.no_push)
+        rec = ch.append(payload, flush=True).record
+        assert rec is not None       # flush=True 면 돌아온 티켓은 settled 다
         _emit(
             {
                 "ok": True,
@@ -198,7 +205,7 @@ def cmd_append(args: argparse.Namespace) -> int:
                 "id": rec.id,
                 "sender": rec.sender,
                 "ts": rec.to_dict()["ts"],
-                "pushed": not args.no_push,
+                "pushed": True,
             }
         )
     return EXIT_OK
@@ -351,7 +358,6 @@ def build_parser() -> argparse.ArgumentParser:
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("--payload", default=None, help="JSON 문자열")
     g.add_argument("--payload-file", default=None, help="JSON 파일 경로 ('-' 는 stdin)")
-    sp.add_argument("--no-push", action="store_true", help="로컬에만 쓰고 push 안 함")
     sp.set_defaults(func=cmd_append)
 
     sp = sub.add_parser("ack", help="peek 로 받은 레코드까지 커서를 전진")
