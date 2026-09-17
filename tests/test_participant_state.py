@@ -334,9 +334,9 @@ def test_한_사람_두_기기가_같은_경로를_써도_push_가_깨지지_않
 # ------------------------- P-5. 롤업·compact 가 건드리지 않는다
 
 
-def test_롤업이_상태를_건드리지_않는다(bare_repo, participant):
+def test_아카이빙과_삭제가_상태를_건드리지_않는다(bare_repo, participant):
     alice = participant("alice")
-    # 지난 날짜 레코드 (접을 수 있게)
+    # 지난 날짜 레코드 (옮길 수 있게)
     alice.clock = FixedOffsetClock(0.0)
     old = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
