@@ -669,6 +669,16 @@ def test_recover_archive_says_so_when_history_is_gone(participant):
         a.recover_archive("not-a-day")
 
 
+def test_archive_gaps_is_empty_when_nothing_was_ever_deleted(participant):
+    """삭제가 한 번도 없었으면 빈 날짜를 찾지 않는다 (git 호출 1회로 끝낸다).
+
+    갓 만든 방에서 기동마다 `max_days` 번씩 git 을 띄우지 않는 근거다.
+    """
+    a = participant("a")
+    write_past(a, 2, [{"n": i} for i in range(3)])
+    assert a.archive_gaps(R.last_closed_day(a.clock.now(), 2.0), max_days=60) == []
+
+
 def test_archive_gaps_finds_missing_days(participant):
     """기동 직후 훑기 — 라이브도 아니고 로컬 아카이브도 없는 날짜를 집어낸다."""
     a = participant("a")

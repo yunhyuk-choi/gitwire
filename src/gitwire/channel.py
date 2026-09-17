@@ -711,9 +711,13 @@ class Channel:
         )
         try:
             self._push()
-        except (PushRejected, GitError) as exc:
-            # 남이 먼저 심었거나 지금 원격이 움직였다. 다음 발행이 같은 경로로
-            # 통합한다 — 여기서 대화를 막을 이유가 없다.
+        except GitwireError as exc:
+            # 남이 먼저 심었거나, 원격이 움직였거나, **쓰기 권한이 없다**
+            # (읽기 전용 참가자). 어느 쪽이든 여기서 대화를 막을 이유가 없다 —
+            # 이 커밋은 편의이고, 이 클론에서는 이미 무시가 적용된다.
+            # ⚠️ `GitwireError` 로 넓게 받는다: `AuthError` 는 `GitError` 의
+            # 하위가 아니라서 좁게 받으면 토큰 없는 참가자의 `open()` 이 통째로
+            # 실패한다.
             log.info("gitwire: .gitignore push 를 미룬다 (%s)", exc)
 
     # ------------------------------------------------------- 변경 감지 / 동기
@@ -2454,6 +2458,16 @@ class Channel:
         """
         self.open()
         if not _rollup.is_day(through):
+            return []
+        # ⭐ 이 레포에서 레코드가 **한 번도 지워지지 않았다면** 빈 날짜를 찾을
+        # 이유가 없다 (그 날에 레코드가 없었을 뿐이다). pathspec 으로 좁힌
+        # `log -1` **한 번**이 날짜별 조회 `max_days` 번을 없앤다 — 갓 만든 방에서
+        # 기동마다 60번씩 git 을 띄우지 않는 근거다.
+        probe = self.git.run(
+            "log", "-1", "--format=%H", "--diff-filter=D",
+            "--", records.RECORD_DIR + "/", check=False,
+        )
+        if probe.returncode != 0 or not probe.stdout.strip():
             return []
         with self._lock:
             head = self._head()
