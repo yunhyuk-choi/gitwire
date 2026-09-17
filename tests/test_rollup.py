@@ -580,17 +580,23 @@ def test_rollup_commit_is_an_ordinary_fast_forward(participant):
     assert int(a.git.out("rev-list", "--count", "HEAD")) == n_before + 1
 
 
-def test_unpushed_records_are_flushed_before_rollup(participant):
-    """롤업은 내 미푸시 레코드를 먼저 올린다 — 뒤에 남겨두고 접지 않는다."""
+def test_queued_records_are_flushed_before_rollup(participant):
+    """롤업은 대기열을 먼저 밀어낸다 — 뒤에 남겨두고 접지 않는다.
+
+    ⚠️ 대기열에 있는 건은 **접을 수 없다** — 시각이 아직 없기 때문이다(id 는
+    push 때 정해진다). 그래서 먼저 밀어내는 것이 유일한 정답이고, 그렇게 나간
+    레코드는 정의상 *오늘* 것이라 이번 롤업 대상이 아니다.
+    """
     a = participant("a", batch_window=3600.0)       # 자동 flush 를 사실상 끔
-    a.clock = past(2)
-    pending = [a.append({"n": i}) for i in range(3)]
-    a.clock = FixedOffsetClock(0.0)
-    assert a._pending
+    old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(3)])   # 접을 대상
+    queued = a.append({"n": "대기열"})
+    assert a.info()["pending"] == 1
+
     res = a.rollup(min_records=1)
     assert res["rolled"] is True
+    assert queued.pushed is True, "롤업 전에 대기열을 밀어내지 않았다"
     ids = [r.id for r in a.history(fresh=False)]
-    assert ids == [r.id for r in pending]
+    assert ids == sorted([r.id for r in old] + [queued.id])
 
 
 # ------------------------------------------------------------------ CLI

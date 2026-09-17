@@ -14,8 +14,9 @@ payload 안을 절대 해석하지 않는다. 스키마는 소비자(채팅·칸
     ch = gitwire.open_channel("https://github.com/me/my-room.git",
                               credential=gitwire.TokenCredential.from_env())
 
-    # 발행
-    ch.append({"kind": "msg", "body": "안녕"})
+    # 발행 — 대기열에 넣고 티켓을 받는다. **시각·id 는 push 되는 순간에** 정해진다
+    ticket = ch.append({"kind": "msg", "body": "안녕"})
+    rec = ticket.wait(30)            # 나가면 그 Record (못 나가면 None)
 
     # 일회성 조회 (한 번 실행하고 끝나는 소비자 — 에이전트 등)
     for rec in ch.fetch_new():
@@ -44,6 +45,7 @@ from .channel import (
     DEFAULT_ROLLUP_INTERVAL,
     Channel,
     HistoryPage,
+    PendingRecord,
     Subscription,
     credential_cache,
     open_channel,
@@ -58,6 +60,7 @@ from .errors import (
     GitError,
     GitwireError,
     HistoryRewritten,
+    NotPushed,
     PushRejected,
 )
 from .gitcmd import GitRunner, SubprocessGitRunner
@@ -91,6 +94,7 @@ __all__ = [
     "open_channel",
     "Hub",
     "Record",
+    "PendingRecord",
     "HistoryPage",
     # 레코드 id 형식 판정 (커서에 id 아닌 값이 들어가는 것을 막는 문)
     "is_record_id",
@@ -129,6 +133,7 @@ __all__ = [
     "GitError",
     "AuthError",
     "PushRejected",
+    "NotPushed",
     "ChannelInitError",
     "HistoryRewritten",
     "ClockError",

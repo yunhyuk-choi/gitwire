@@ -109,21 +109,29 @@ def test_explicit_sender_is_respected(bare_repo, homes):
 # ------------------------------------------------- B. append 반환값
 
 
-def test_append_returns_record_with_microsecond_precision(participant):
-    """ID 에서 되파싱하면 밀리초로 깎인다 — 그래서 Record 를 돌려준다."""
+def test_append_ticket_carries_the_envelope_after_push(participant):
+    """`append()` 는 **티켓**을 주고, 봉투(ID·시각)는 push 때 달린다.
+
+    ⭐ 그리고 봉투의 시각과 ID 의 스탬프가 **정확히 같다**. 시각을 밀리초로
+    맞춰 찍기 때문이다(`Channel._stamp`) — 파일명이 담을 수 있는 정밀도가
+    밀리초이므로, 봉투에 마이크로초를 남기면 "ID 가 정렬 키"라는 규약에서 두
+    값이 미세하게 어긋난 채로 남는다.
+    """
     ts = datetime(2026, 9, 3, 10, 11, 12, 345678, tzinfo=timezone.utc)
     a = participant("alice", clock=FrozenClock(ts))
 
-    rec = a.append({"n": 1}, flush=True)
+    ticket = a.append({"n": 1}, flush=True)
 
+    assert isinstance(ticket, gitwire.PendingRecord)
+    assert ticket.pushed is True                 # flush=True 라 이미 나갔다
+    rec = ticket.record
     assert isinstance(rec, gitwire.Record)
     assert rec.sender == "alice"
-    assert rec.timestamp == ts
     assert rec.payload == {"n": 1}
-    # 파일명(=ID)이 담을 수 있는 정밀도는 밀리초까지다.
+    # 봉투 시각 = ID 스탬프 (둘 다 밀리초)
     stamp = rec.id.rsplit("/", 1)[-1].split("-", 1)[0]
-    assert records.parse_ts(stamp).microsecond == 345000
-    assert rec.timestamp.microsecond == 345678, "ID 되파싱 수준으로 정밀도가 깎였다"
+    assert records.parse_ts(stamp) == rec.timestamp
+    assert rec.timestamp == ts.replace(microsecond=345000)
 
 
 def test_append_record_matches_what_others_read(participant):
@@ -403,23 +411,28 @@ def test_cache_cannot_go_stale_when_new_records_arrive(bare_repo, homes):
 def test_cache_cannot_go_stale_when_a_past_day_grows(bare_repo, homes):
     """⭐ "지난 날짜는 안 바뀐다"는 가정을 쓰지 않았음을 못 박는다.
 
-    오프라인에서 쓰고 나중에 push 하거나 시계가 어긋난 참가자는 **과거 날짜에**
-    레코드를 추가한다. 규칙 기반 무효화였다면 여기서 조용히 틀린다.
+    ⚠️ 과거 날짜가 자라는 경로가 **하나로 줄었다.** 예전에는 "오프라인에서 쓰고
+    나중에 push" 가 그 경로였는데, 이제 시각은 push 되는 순간에 찍히므로 그 일이
+    일어나지 않는다 (`Channel.append`). 남은 것은 **시계가 어긋난 다른 참가자**
+    뿐이다 — 공통 시계의 잔여 오차는 초 단위지만 자정 근처에서는 날짜가 갈린다.
+    그 참가자를 그대로 만들어 검증한다 (같은 채널의 스탬프 단조 증가 가드를
+    우회하려는 것이 아니라, 진짜로 *다른 참가자*라서 별 채널이다).
     """
     writer = participant_channel(bare_repo, homes("w"))
     _fill(writer, 6, step=timedelta(hours=8))          # 9/1 3건, 9/2 3건
     reader = participant_channel(bare_repo, homes("r"), sender="reader")
+    skewed = participant_channel(bare_repo, homes("s"), sender="skewed")
     try:
         before_ids = reader.record_ids()
         days = sorted({i.split("/")[1] for i in before_ids})
         assert len(days) == 2
         assert reader.cache_info()["entries"] > 0      # 두 날짜 모두 캐시에 있다
 
-        # 뒤늦게 도착한 **첫째 날짜**의 레코드 (오프라인 참가자를 흉내낸다)
-        writer.clock = FrozenClock(
+        # 시계가 하루 어긋난 참가자가 **첫째 날짜**에 레코드를 더한다
+        skewed.clock = FrozenClock(
             datetime(2026, 9, 1, 12, 0, 0, tzinfo=timezone.utc)
         )
-        late = writer.append({"i": 999}, flush=True)
+        late = skewed.append({"i": 999}, flush=True)
         assert late.id.split("/")[1] == days[0], "첫째 날짜에 들어가야 하는 레코드다"
 
         after = reader.record_ids()
@@ -432,6 +445,7 @@ def test_cache_cannot_go_stale_when_a_past_day_grows(bare_repo, homes):
         assert late.id in [r.id for r in page.records]
     finally:
         reader.close()
+        skewed.close()
         writer.close()
 
 

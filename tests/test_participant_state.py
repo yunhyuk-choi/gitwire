@@ -124,14 +124,17 @@ def test_상태가_원격까지_간다(bare_repo, participant):
 def test_레코드와_상태가_한_커밋으로_나간다(bare_repo, participant):
     """부수 상태의 발행이 메시지 전송보다 앞서 끼어들지 않는다 — 같이 실려 간다."""
     alice = participant("alice", batch_window=5.0)
-    rec = alice.append({"i": 1})
-    alice.write_state("alice@x.io", {"cursor": rec.id})
+    ticket = alice.append({"i": 1})
+    # ⚠️ 커서 값으로 `ticket.id` 를 쓸 수 없다 — 아직 없다(push 때 정해진다).
+    # 이 테스트의 관심사는 *둘이 한 커밋으로 나가는가*이므로 값은 무엇이든 좋다.
+    alice.write_state("alice@x.io", {"cursor": "나중에"})
     assert alice.info()["pending"] == 1
     assert alice.info()["pending_state"] == 1
-    alice.flush()
+    made = alice.flush()
 
     files = _remote_files(bare_repo)
-    assert rec.id in files and "participants/alice@x.io.json" in files
+    assert ticket.id == made[0].id
+    assert ticket.id in files and "participants/alice@x.io.json" in files
     log = _git_bare(bare_repo, "log", "--format=%s", "-1")
     assert "record(s)" in log and "참가자 상태" in log, log
 

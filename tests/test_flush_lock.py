@@ -69,7 +69,9 @@ def test_push_does_not_block_append_or_reads(participant, capsys):
         t0 = time.perf_counter()
         rec = a.append({"n": i})
         sends.append((time.perf_counter() - t0) * 1000)
-        assert rec.id                      # 응답만 빠르고 빈 것이면 의미가 없다
+        # 응답만 빠르고 빈 것이면 의미가 없다. id 는 아직 없는 것이 정상이므로
+        # (push 때 정해진다) 대기열에 **실제로 들어갔는지**를 본다.
+        assert rec.pushed is False and rec.payload == {"n": i}
         t1 = time.perf_counter()
         a.history_page(limit=10, fresh=False)
         reads.append((time.perf_counter() - t1) * 1000)
@@ -142,6 +144,9 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
 
     락 밖에서 `HEAD:` 로 밀고 나서 그때의 HEAD 를 표시하면, push 중에 늘어난
     커밋까지 "올렸다"가 되어 **조용히 유실**된다. 명시 sha 로 미는 이유다.
+
+    ⭐ 이제 push 중에 늘어날 수 있는 것은 **참가자 상태 커밋**이다 — 레코드는
+    대기열(메모리)에 있다가 `flush()` 안에서만 커밋된다. 그래서 그 경로로 잰다.
     """
     runner = SlowPushRunner()
     a = participant("a", runner=runner, batch_window=3600.0)
@@ -150,11 +155,13 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
     pushed = a.git.out("rev-parse", "refs/gitwire/pushed")
     assert pushed == a.git.out("rev-parse", "HEAD")
 
-    late = a.append({"n": 1})
+    a.write_state("me@localhost", {"cursor": "c1"})
     a._absorb_worktree()                   # 커밋만 만들고 push 는 하지 않는다
     assert a._unpushed_count() == 1        # 표시가 정확해야 이게 1이 된다
+    late = a.append({"n": 1})
     a.flush()
     assert late.id in landed(bare_repo, homes)
+    assert a._unpushed_count() == 0
 
 
 def test_concurrent_participants_do_not_lose_records(participant, bare_repo, homes):

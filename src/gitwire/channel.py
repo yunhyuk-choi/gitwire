@@ -15,7 +15,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -26,7 +26,13 @@ from . import rollup as _rollup
 from . import state as _state
 from .credentials import Credential, NoCredential
 from .cursor import Cursor, CursorStore, DEFAULT_CONSUMER
-from .errors import ChannelInitError, GitError, HistoryRewritten, PushRejected
+from .errors import (
+    ChannelInitError,
+    GitError,
+    HistoryRewritten,
+    NotPushed,
+    PushRejected,
+)
 from .gitcmd import Git, GitRunner, SubprocessGitRunner
 from .treecache import TreeCache
 
@@ -69,6 +75,10 @@ _REBASE_RESOLVE = ("-X", "theirs")
 
 #: 기본 페이지 크기 (역방향 페이징)
 DEFAULT_PAGE = 50
+
+#: 한 레코드의 시각 해상도 = 1밀리초 (`records.format_ts`). 같은 커밋으로 나가는
+#: 여러 건에 **서로 다른, 증가하는** 스탬프를 주는 최소 단위다 (`Channel._stamp`).
+_MS = timedelta(milliseconds=1)
 
 #: 자격증명 메모리 캐시의 기본 수명(초). `credential_cache()` 참조.
 DEFAULT_CREDENTIAL_CACHE_TIMEOUT = 900.0
@@ -135,6 +145,107 @@ class HistoryPage:
 
     def __iter__(self):
         return iter(self.records)
+
+
+class PendingRecord:
+    """`append()` 가 돌려주는 **대기열 티켓**. 레코드가 될 자리이지 레코드가 아니다.
+
+    ⭐ 왜 `Record` 가 아닌가 — **id 와 시각이 아직 없기 때문이다.**
+
+    레코드의 시각은 *원격에 push 되는 순간*이고 id 는 그 시각에서 파생된
+    파일 경로다 (`Channel.append` 도크의 근거). 그러니 발행 시점에 `Record` 를
+    돌려주려면 없는 값을 지어내야 한다. 그래서 그 자리를 가리키는 티켓을 주고,
+    실제 레코드는 push 가 확정될 때 여기에 달린다:
+
+        ticket = ch.append({"body": "안녕"})
+        ticket.pushed          # False — 아직 대기열
+        rec = ticket.wait(30)  # push 되면 그 Record (못 나가면 None)
+        rec.id                 # 여기서야 id 가 있다
+
+    `append(flush=True)` 는 자기 호출 안에서 push 까지 끝내므로 돌아온 티켓이
+    **이미 settled** 다 — 그래서 `ticket.id` 를 바로 쓸 수 있다.
+
+    ⚠️ 아직 안 나간 티켓의 `id`·`timestamp` 는 **묻는 것 자체가 오류**다
+    (`NotPushed`). 대신 지어낸 임시값을 주면 소비자가 그것을 커서·정렬 키로
+    쓰게 되고, 그 사고는 실제로 있었다 (`records.is_record_id` 도크).
+    """
+
+    __slots__ = ("seq", "payload", "sender", "_done", "_record", "_dropped")
+
+    def __init__(self, seq: int, payload: Any, sender: str) -> None:
+        self.seq = seq
+        """이 채널 객체 안에서의 발행 순번 (프로세스 지역 — 레코드 id 가 아니다)."""
+        self.payload = payload
+        """발행할 불투명 JSON. 대기 중에도 알 수 있는 값이라 그대로 공개한다."""
+        self.sender = sender
+        """발행할 설치본 식별자 (슬러그 처리됨). 이것도 대기 중에 정해진다."""
+        self._done = threading.Event()
+        self._record: records.Record | None = None
+        self._dropped = False
+
+    @property
+    def pushed(self) -> bool:
+        """원격에 나갔나. 이것이 참이 되는 순간에 id·시각이 생긴다."""
+        return self._record is not None
+
+    @property
+    def dropped(self) -> bool:
+        """채널이 닫힐 때까지 못 나갔다 → **버려졌다.**
+
+        대기열은 메모리다. 프로세스가 죽으면 아직 안 나간 것은 사라진다 —
+        그게 의도다 (`Channel.append` 도크). 이 값은 그 사실을 *알려 주는*
+        쪽이고, `close()` 가 마지막 flush 에 실패했을 때 참이 된다.
+        """
+        return self._dropped
+
+    @property
+    def record(self) -> records.Record | None:
+        """push 된 레코드. 아직 대기열이면 None."""
+        return self._record
+
+    @property
+    def id(self) -> str:
+        """레코드 id(= 레포 상대 경로). 아직 안 나갔으면 `NotPushed`."""
+        return self._require().id
+
+    @property
+    def timestamp(self) -> datetime:
+        """레코드 시각(= push 시점, UTC). 아직 안 나갔으면 `NotPushed`."""
+        return self._require().timestamp
+
+    def wait(self, timeout: float | None = None) -> records.Record | None:
+        """push 될 때까지 기다린다. 나간 레코드, 또는 **None**.
+
+        None 인 경우는 둘이고 둘 다 정상 결과다: `timeout` 이 지났다(아직 미는
+        중일 수 있다) / 채널이 닫히면서 버려졌다(`dropped`).
+        """
+        if not self._done.wait(timeout):
+            return None
+        return self._record
+
+    def _require(self) -> records.Record:
+        rec = self._record
+        if rec is None:
+            raise NotPushed(
+                "이 레코드는 아직 대기열에 있다 — id·시각은 원격에 push 되는 "
+                "순간에 정해진다. flush() 로 밀거나 wait() 로 기다려라."
+            )
+        return rec
+
+    def _settle(self, record: records.Record) -> None:
+        self._record = record
+        self._done.set()
+
+    def _drop(self) -> None:
+        self._dropped = True
+        self._done.set()
+
+    def __repr__(self) -> str:
+        rec = self._record
+        where = f"id={rec.id!r}" if rec is not None else (
+            "dropped" if self._dropped else "queued"
+        )
+        return f"PendingRecord(seq={self.seq}, sender={self.sender!r}, {where})"
 
 
 class Subscription:
@@ -254,8 +365,8 @@ class Channel:
         )
         # ⭐ 락이 둘이다. **순서는 언제나 `_remote` → `_lock`** 이며 그 반대는 없다.
         #
-        # `_lock`   : 작업 사본·인덱스·`_pending`·커서·캐시를 만지는 **짧은 로컬**
-        #             구간. `append()` 와 모든 읽기 API 가 이것만 쓴다 →
+        # `_lock`   : 작업 사본·인덱스·발행 대기열·커서·캐시를 만지는 **짧은
+        #             로컬** 구간. `append()` 와 모든 읽기 API 가 이것만 쓴다 →
         #             네트워크 때문에 막히는 일이 없어야 한다.
         # `_remote` : "원격 상태 전이"(커밋 → push → fetch → 통합) 전체를
         #             직렬화한다. **네트워크를 여기서 기다린다.** 두 스레드가
@@ -270,6 +381,17 @@ class Channel:
         # 교착이 생긴다. 부트스트랩은 `_opened` + `_lock` 으로만 보호한다.
         self._lock = threading.RLock()
         self._remote = threading.RLock()
+        # ⭐ **발행 대기열 — 메모리다.** `append()` 는 여기에만 넣고, 시각·id·
+        # 파일 쓰기·커밋은 전부 `flush()` 가 push 직전에 한다 (`append` 도크).
+        # 디스크에 영속시키지 않는다: 그러면 "죽기 전에 못 나간 것"이 다음 기동에
+        # 과거 시각으로 되살아나고, 그것이 고치려는 결함 자체다.
+        self._queue: list[PendingRecord] = []
+        self._seq = 0
+        # 마지막으로 찍은 스탬프 (밀리초 절삭). 같은 밀리초·거꾸로 가는 시계에도
+        # 스탬프가 **단조 증가**하게 만든다 — 근거는 `_stamp()`.
+        self._last_stamp: datetime | None = None
+        # 찍었지만 아직 커밋되지 않은 레코드 경로 (커밋 메시지의 건수용).
+        # `flush()` 안의 materialize~commit 구간에서만 차 있다.
         self._pending: list[str] = []
         # 아직 커밋되지 않은 **참가자 상태** 경로 (`state.py`). 레코드와 따로
         # 세는 이유: 레코드는 "사건 N건"이고 이쪽은 "값을 덮어썼다"라 커밋
@@ -594,10 +716,15 @@ class Channel:
         return f"gitwire: {n or 1} record(s)"
 
     def _absorb_worktree(self) -> None:
-        """작업 사본에 남은 미커밋 레코드·참가자 상태를 먼저 커밋한다.
+        """작업 사본의 미커밋 변경(레코드·참가자 상태)을 커밋한다.
 
-        아래 통합 로직은 `reset --hard` 를 쓸 수 있는데, 그건 **미커밋 파일을
-        지운다.** 파괴적 동작 전에 항상 흡수해서 데이터를 잃지 않는다.
+        두 자리에서 부른다:
+
+        * `flush()` — 방금 찍은 레코드를 커밋한다 (push 직전).
+        * `_integrate()` — 아래 통합 로직은 `reset --hard` 를 쓸 수 있는데 그건
+          **미커밋 파일을 지운다.** 파괴적 동작 전에 흡수해서 잃지 않는다. 여기서
+          걸리는 것은 보통 **참가자 상태**뿐이다 — 레코드는 `flush()` 안의
+          찍기~커밋 구간(락 안)에서만 작업 사본에 존재한다.
         """
         g = self.git
         g.run("add", "-A", "--", *self._commit_specs(), check=False)
@@ -780,44 +907,152 @@ class Channel:
         *,
         sender: str | None = None,
         flush: bool = False,
-    ) -> records.Record:
-        """레코드 1건을 발행한다. **반환값은 방금 만든 `Record`** 다.
+    ) -> PendingRecord:
+        """레코드 1건을 **대기열에 넣는다.** 반환값은 티켓(`PendingRecord`)이다.
 
         payload 는 **불투명한 JSON** 이다 — gitwire 는 내용을 해석하지 않는다.
 
-        ⚠️ ID 만 돌려주던 시절에는 소비자가 `sender`·`timestamp` 를 알려면 ID
-        문자열을 되파싱해야 했다. 그 과정에서 파일명의 밀리초 절삭 때문에
-        마이크로초 정밀도가 깎이고, 봉투 규약이 소비자 쪽으로 새어 나갔다.
-        발행한 쪽은 이미 세 값을 다 알고 있으므로 그대로 돌려주는 것이 옳다
-        (로컬 에코를 그리는 소비자에게 필수다).
+        ⭐ **시각과 id 는 원격에 push 되는 순간에 정해진다** (여기서가 아니다)
+        --------------------------------------------------------------------
+        레코드 id = `records/<날짜>/<시각>-<발신자>-<난수>.json` 이고 그것이 곧
+        **정렬 키이자 커서 값**이다. 예전에는 이 호출이 *작성 시각*으로 id 를
+        굳혔고 push 는 나중에 했다. 그래서 오프라인에서 쓴 메시지가 며칠 뒤에
+        나가면 **과거 날짜 id 로 도착**했고, 실측된 결과가 두 가지였다:
 
-        파일은 즉시 디스크에 쓰이고(내구성), 커밋·push 는 배칭 창(batch_window)
-        안의 여러 건을 묶어 한 커밋으로 나간다. `flush=True` 면 즉시 밀어낸다.
+        * 안 읽음 카운트가 `|{p ≠ A, cursor(p) < M}|` 이고 커서는 단조 증가라,
+          과거 id 는 모두의 커서보다 앞이다 → **아무도 안 봤는데 카운트 0**
+          (= 전원 읽음으로 보인다).
+        * 화면에서는 며칠 위에 끼워진다 → OS 알림은 오는데 **볼 곳이 없다.**
+
+        그래서 이 호출은 아무 시각도 찍지 않는다. 대기열에 넣고 티켓만 준다.
+        작성 시각은 **남기지 않는다** — 쓰지 않는 값을 봉투에 넣으면 그때부터
+        "어느 시각이 정본인가"를 소비자마다 다시 판단해야 한다.
+
+        ⭐ **대기열은 메모리다 — 죽으면 사라진다** (의도된 성질)
+        -----------------------------------------------------
+        "보내고 바로 죽여도 다음 기동이 밀어낸다"는 보장을 **버렸다.** 그 보장을
+        지키려면 안 나간 레코드를 디스크에 남기고 다음 기동이 밀어야 하는데, 그
+        순간 위의 과거-날짜 결함이 되살아난다(또는 다음 기동이 새 시각을 찍어야
+        하고, 그러면 "안 나간 것을 언제 찍나"라는 같은 문제가 한 겹 늘어난다).
+        대신 **살아 있는 동안**은 순서와 무손실을 지킨다: 앞 건이 실패하면 뒤
+        건을 먼저 보내지 않고(`flush()`), 실패는 계속 재시도된다.
+
+        소비자는 그래서 *아직 안 나간 것*을 "보냈다"고 표시해서는 안 된다
+        (gitwire-chat 은 낙관적 항목에 `~pending/` 임시 id 를 주고, push 되어
+        실제 id 가 생기는 순간에 갈아끼운다).
+
+        커밋·push 는 배칭 창(`batch_window`) 안의 여러 건을 묶어 한 커밋으로
+        나간다. `flush=True` 면 이 호출 안에서 push 까지 끝내므로 돌아온 티켓이
+        이미 settled 다 (`ticket.id` 를 바로 쓸 수 있다).
         """
         with self._lock:
             self.open()
             who = records.slug_sender(sender or self.sender)
-            ts = self.clock.now()
-            rid = records.make_record_id(ts, who)
-            path = self.clone_dir / rid
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(records.encode(rid, who, ts, payload))
-            record = records.Record(
-                id=rid, sender=who, timestamp=ts.astimezone(timezone.utc),
-                payload=payload,
-            )
-            self._pending.append(rid)
+            self._seq += 1
+            ticket = PendingRecord(self._seq, payload, who)
+            self._queue.append(ticket)
             if self._pending_since is None:
                 self._pending_since = time.monotonic()
             need_now = (
-                flush or self.batch_window <= 0 or len(self._pending) >= self.max_batch
+                flush or self.batch_window <= 0 or len(self._queue) >= self.max_batch
             )
             if not need_now:
                 self._ensure_flusher()
                 self._flush_cv.notify_all()
         if need_now:
             self.flush()
-        return record
+        return ticket
+
+    def _stamp(self) -> datetime:
+        """**지금**을 레코드 시각으로 찍는다 (밀리초 해상도 · 단조 증가).
+
+        ⚠️ 두 가지를 이 한 곳에서 보장한다:
+
+        * **밀리초 절삭** — 파일명 스탬프가 밀리초다(`records.format_ts`).
+          봉투에 마이크로초를 남기면 봉투와 id 의 시각이 미세하게 어긋나고,
+          "id 가 정렬 키"라는 규약에서 그 차이는 언젠가 반드시 물린다.
+        * **단조 증가** — 한 커밋으로 나가는 여러 건은 거의 같은 순간에 찍히므로
+          그대로 두면 같은 밀리초가 되고, 그러면 둘 사이의 순서가 난수 접미로
+          갈려 **발행 순서와 달라진다.** 앞 건보다 크지 않으면 1ms 를 더해
+          대기열 순서 = id 순서를 만든다. 시계가 거꾸로 간 경우(보정 재조회)도
+          같은 가드에 걸리므로 **과거 날짜 id 가 새로 생기지 않는다.**
+
+        ⚠️ 호출자는 `_lock` 을 쥔 채 부른다 — `_last_stamp` 가 공유 상태다.
+        """
+        ts = self.clock.now().astimezone(timezone.utc)
+        ts = ts.replace(microsecond=(ts.microsecond // 1000) * 1000)
+        last = self._last_stamp
+        if last is not None and ts <= last:
+            ts = last + _MS
+        self._last_stamp = ts
+        return ts
+
+    def _materialize(self, batch: list[PendingRecord]) -> list[records.Record]:
+        """대기열 항목을 **지금** 레코드로 만든다 — 시각 → id → 파일.
+
+        ⭐ 「시각 = push 되는 순간」의 본체가 여기다. 호출자(`flush()`)는 이
+        직후에 커밋하고 곧바로 push 하며, **push 가 실패하면 되돌린다**
+        (`_rewind()`) — 그래서 찍힌 시각과 실제 착지 시각이 벌어지지 않는다.
+        """
+        made: list[records.Record] = []
+        for item in batch:
+            ts = self._stamp()
+            rid = records.make_record_id(ts, item.sender)
+            path = self.clone_dir / rid
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(records.encode(rid, item.sender, ts, item.payload))
+            self._pending.append(rid)
+            made.append(
+                records.Record(
+                    id=rid, sender=item.sender, timestamp=ts, payload=item.payload
+                )
+            )
+        return made
+
+    def _rewind(
+        self, base: str | None, made: list[records.Record], staged: set[str]
+    ) -> None:
+        """push 가 실패했다 — 방금 찍은 레코드를 **없던 일로 되돌린다.**
+
+        ⭐ 되돌리지 않으면 이번 변경의 요점이 깨진다. 찍어 둔 레코드를 커밋으로
+        남기면 그것이 *언제 나갈지 모르는 과거 시각 레코드*가 된다 — 몇 시간
+        뒤에 다른 push 경로가 밀어내면 과거 날짜 id 가 그대로 원격에 생긴다.
+        대기열로 돌려놓으면 다음 시도가 **그때의 시각**을 다시 찍는다.
+
+        ⚠️ `reset --mixed` 다(`--hard` 가 아니다). 같은 커밋에는 **참가자 상태**
+        (읽음 커서 등)도 함께 실려 가는데, `--hard` 는 작업 사본까지 되돌려 그
+        값을 조용히 지운다. 그래서 커밋만 되돌리고, 레코드 파일은 우리가 경로를
+        알고 있으므로 직접 지운다. 상태는 작업 사본에 그대로 남아 다음 flush 에
+        다시 실린다(`staged` 를 미커밋으로 복원한다).
+        """
+        if not made:
+            return
+        if base:
+            self.git.run("reset", "--mixed", base, check=False)
+        for rec in made:
+            path = self.clone_dir / rec.id
+            path.unlink(missing_ok=True)
+            try:
+                path.parent.rmdir()      # 그 날짜의 첫 건이었으면 디렉토리까지
+            except OSError:
+                pass                     # 다른 레코드가 있다 — 그대로 둔다
+        self._pending.clear()
+        self._pending_state.update(staged)
+        if self._has_pending() and self._pending_since is None:
+            self._pending_since = time.monotonic()
+
+    def _settle(
+        self, batch: list[PendingRecord], made: list[records.Record]
+    ) -> None:
+        """push 가 확정됐다 — 티켓에 레코드를 달고 대기열 앞쪽을 걷어낸다.
+
+        대기열에서 빼는 것은 `flush()` 뿐이고 그것은 `_remote` 로 직렬화되므로,
+        앞에서 `len(batch)` 개를 잘라내는 것이 곧 우리가 민 그 건들이다
+        (`append()` 는 뒤에만 붙인다).
+        """
+        for item, rec in zip(batch, made):
+            item._settle(rec)
+        del self._queue[: len(batch)]
 
     def _ensure_flusher(self) -> None:
         if self._flusher and self._flusher.is_alive():
@@ -829,8 +1064,8 @@ class Channel:
         self._flusher.start()
 
     def _has_pending(self) -> bool:
-        """아직 커밋되지 않은 것이 있나 (레코드 **또는** 참가자 상태)."""
-        return bool(self._pending or self._pending_state)
+        """아직 밀어내지 못한 것이 있나 (대기열의 레코드 **또는** 참가자 상태)."""
+        return bool(self._queue or self._pending_state)
 
     def _flush_loop(self) -> None:
         while not self._closing.is_set():
@@ -841,7 +1076,7 @@ class Channel:
                         return
                 since = self._pending_since or time.monotonic()
                 wait = self.batch_window - (time.monotonic() - since)
-                if wait > 0 and len(self._pending) < self.max_batch:
+                if wait > 0 and len(self._queue) < self.max_batch:
                     self._flush_cv.wait(timeout=wait)
                     continue
             try:
@@ -850,8 +1085,20 @@ class Channel:
                 log.exception("gitwire: 배치 flush 실패")
                 time.sleep(min(self.batch_window, 5.0))
 
-    def flush(self, push_attempts: int = DEFAULT_PUSH_ATTEMPTS) -> int:
-        """대기 중인 레코드를 **한 커밋**으로 묶어 커밋·push 한다. 커밋된 건수.
+    def flush(self, push_attempts: int = DEFAULT_PUSH_ATTEMPTS) -> list[records.Record]:
+        """대기열을 **한 커밋**으로 묶어 찍고·커밋하고·push 한다. 나간 레코드들.
+
+        ⭐ **여기가 레코드의 시각과 id 가 정해지는 유일한 자리다.** 순서는
+        고정이다: 스탬프(`_materialize`) → 커밋 → push. 그 사이에 네트워크가
+        없으므로 "찍힌 시각"과 "원격에 착지한 시각"이 벌어지지 않는다. push 가
+        실패하면 찍은 것을 **되돌려 대기열로 돌려놓는다**(`_rewind`) — 다음
+        시도가 그때의 시각을 다시 찍는다. 그래서 과거 날짜 레코드가 새로 생기는
+        경로가 남지 않는다.
+
+        ⭐ **순서를 지킨다.** 대기열 앞에서부터 잘라 한 커밋으로 밀고, 그 push 가
+        성공할 때까지 뒤 건을 따로 보내지 않는다(같은 커밋에 실리거나, 실패하면
+        함께 대기열로 돌아간다). `_remote` 가 flush 끼리를 직렬화하므로 두 push
+        가 겹치지도 않는다.
 
         ⭐ **push(네트워크)를 채널 락 안에서 하지 않는다.**
 
@@ -862,28 +1109,68 @@ class Channel:
         (같은 실수를 `sync()` 에서 한 번 고쳤는데 `flush()` 만 그 규율 밖에
         남아 있었다.)
 
-        지금은 커밋까지만 `_lock` 안에서 하고, push 는 `_remote` 만 쥔 채
+        지금은 찍기·커밋까지만 `_lock` 안에서 하고, push 는 `_remote` 만 쥔 채
         **락 밖**에서 기다린다. 같은 조건에서 전송 응답 중앙값이 3365ms → 49ms 가
         되고, push 중 조회는 3484ms → 46ms 가 된다 (README 「push 도 락 밖으로」).
 
-        push 중에 들어오는 `append()` 는 작업 사본에 **새 파일을 쓸 뿐**
-        인덱스·HEAD 를 건드리지 않는다. 그 레코드는 다음 flush 가 가져간다.
-        읽기는 커밋 기준이라 영향이 없다. 위험한 것은 *다른 원격 전이*(sync 의
-        통합·롤업·compact)가 push 도중 끼어들어 우리가 방금 올린 커밋을 로컬에서
-        갈아치우는 경우인데, 그것들이 전부 `_remote` 를 거치므로 겹치지 않는다.
+        push 중에 들어오는 `append()` 는 **메모리 대기열에만** 붙으므로 작업
+        사본·인덱스·HEAD 를 한 바이트도 건드리지 않는다. 그 건들은 다음 flush 가
+        가져간다. 읽기는 커밋 기준이라 영향이 없다. 위험한 것은 *다른 원격
+        전이*(sync 의 통합·롤업·compact)가 push 도중 끼어들어 우리가 방금 올린
+        커밋을 로컬에서 갈아치우는 경우인데, 전부 `_remote` 를 거치므로 겹치지
+        않는다.
         """
         self.open()                          # ⚠️ 락을 잡기 **전에** (교착 방지)
         with self._remote:
-            with self._lock:
-                count = len(self._pending)
-                self._absorb_worktree()      # 커밋 — 로컬 변경이라 락이 필요하다
-                if self._unpushed_count() == 0:
-                    return 0
-                head = self._head()
-            if head is None:
-                return 0
-            self._push_with_retry(head, push_attempts)
-            return count
+            attempts = max(1, push_attempts)
+            delay = 0.05
+            for i in range(attempts):
+                with self._lock:
+                    batch = self._queue[: self.max_batch]
+                    base = self._head()
+                    staged = set(self._pending_state)
+                    made = self._materialize(batch)   # ⭐ 시각·id·파일
+                    self._absorb_worktree()           # 커밋 — 로컬 변경
+                    if not made and self._unpushed_count() == 0:
+                        return []
+                    head = self._head()
+                if head is None:
+                    with self._lock:
+                        self._rewind(base, made, staged)
+                    return []
+                try:
+                    self._push(head)                  # 네트워크 — 채널 락 밖
+                except PushRejected:
+                    # 선점당했다 — 되돌리고, 원격을 받아 **새 시각으로** 다시 찍는다.
+                    with self._lock:
+                        self._rewind(base, made, staged)
+                    if i == attempts - 1:
+                        raise
+                    self._fetch()                     # 네트워크 — 채널 락 밖
+                    with self._lock:
+                        self._integrate()             # 로컬 변경 — 락 안
+                    time.sleep(delay)
+                    delay = min(delay * 2, 2.0)
+                    continue
+                except BaseException:
+                    # ⚠️ 예외로 끝났어도 **원격이 이미 받았을 수 있다**(응답을
+                    # 받기 전에 끊긴 연결). 그대로 되돌리고 다시 찍으면 같은 말이
+                    # id 두 개로 두 번 올라간다 — 재시도가 새 시각을 찍기 때문에
+                    # 예전처럼 "같은 커밋을 다시 민다"로 멱등하지 않다. 그래서
+                    # 한 번 확인한다 (실패 경로에서만 드는 비용이다).
+                    if self._landed(head):
+                        with self._lock:
+                            self._mark_pushed(head)
+                            self._settle(batch, made)
+                        return list(made)
+                    with self._lock:
+                        self._rewind(base, made, staged)
+                    raise
+                with self._lock:
+                    self._mark_pushed(head)      # 방금 **실제로** 올린 sha
+                    self._settle(batch, made)
+                return list(made)
+            return []
 
     def _push(self, sha: str | None = None) -> None:
         """`sha`(기본 HEAD)를 원격 브랜치로 밀어낸다.
@@ -895,30 +1182,19 @@ class Channel:
         """
         self.git.run("push", "origin", f"{sha or 'HEAD'}:refs/heads/{self.branch}")
 
-    def _push_with_retry(self, head: str, attempts: int) -> None:
-        """push 거부(선점) 시 fetch + rebase 후 재시도. **`_remote` 를 쥔 채 부른다.**
+    def _landed(self, head: str) -> bool:
+        """push 가 예외로 끝났지만 원격이 **이미 받았나** — 한 번만 확인한다.
 
-        레코드가 서로 다른 파일이므로 rebase 는 내용 충돌 없이 항상 성공한다.
-        네트워크(push·fetch)는 채널 락 밖에서, 로컬 변경(통합·ref 기록)만 락 안에서.
+        확인 자체가 실패하면(네트워크가 끊겼다) 모른다 → 안 갔다고 본다.
+        되돌리는 쪽이 안전하다: 안 간 것을 안 갔다고 보면 다음 시도가 밀고,
+        간 것을 안 갔다고 보면 중복이 하나 생기는데 — 그 판정을 위해 여기서
+        다시 네트워크를 붙잡고 있을 수는 없다.
         """
-        delay = 0.05
-        last = max(1, attempts) - 1
-        for i in range(max(1, attempts)):
-            try:
-                self._push(head)             # 네트워크 — 채널 락 밖
-            except PushRejected:
-                if i == last:
-                    raise
-                self._fetch()                # 네트워크 — 채널 락 밖
-                with self._lock:
-                    self._integrate()        # 로컬 변경 — 락 안
-                    head = self._head() or head   # rebase 로 sha 가 바뀐다
-                time.sleep(delay)
-                delay = min(delay * 2, 2.0)
-                continue
-            with self._lock:
-                self._mark_pushed(head)      # 방금 **실제로** 올린 sha 를 기록
-            return
+        try:
+            return self.remote_head() == head
+        except Exception:  # noqa: BLE001 — 확인 실패는 판정을 바꿀 뿐이다
+            log.debug("gitwire: push 실패 후 원격 확인 실패", exc_info=True)
+            return False
 
     # ------------------------------------------- 참가자 상태 (예약 경로)
     #
@@ -2037,7 +2313,8 @@ class Channel:
                     "started": cur.started,
                 },
                 "clock_offset": round(float(getattr(self.clock, "offset", 0.0)), 3),
-                "pending": len(self._pending),
+                # ⚠️ 이제 "대기열에 있는(=아직 시각도 안 찍힌) 레코드 수"다.
+                "pending": len(self._queue),
                 "pending_state": len(self._pending_state),
                 "auto_rollup": self.auto_rollup,
                 "archives": len(self._archive_index(self._head()))
@@ -2047,14 +2324,28 @@ class Channel:
             }
 
     def close(self) -> None:
-        """대기 레코드를 밀어내고 백그라운드 스레드를 정리한다."""
+        """대기열을 밀어내고 백그라운드 스레드를 정리한다.
+
+        ⚠️ 정상 종료 경로에서는 **여기서 마지막으로 한 번 민다** — 굳이 다음
+        기동까지 미룰 이유가 없다. 그 push 가 실패하면 남은 티켓은 `dropped` 로
+        표시된다. 대기열은 메모리이므로 그것이 사실이고, 기다리던 쪽(`wait()`)을
+        영원히 붙잡아 두지 않으려면 사실을 알려야 한다. 강제 종료는 이 경로를
+        아예 타지 못하고, 그때도 결과는 같다(사라진다 — `append()` 도크).
+        """
         self._closing.set()
         with self._flush_cv:
             self._flush_cv.notify_all()
         try:
             if self._has_pending():
                 self.flush()
+        except BaseException:
+            log.warning("gitwire: 종료 시 밀어내기 실패 — 대기열을 버린다")
+            raise
         finally:
+            with self._lock:
+                for item in self._queue:
+                    item._drop()
+                self._queue.clear()
             if self._flusher and self._flusher.is_alive():
                 self._flusher.join(timeout=5.0)
             th = self._rollup_thread

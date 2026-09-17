@@ -78,14 +78,20 @@ def test_other_participant_recovers_from_rewrite(participant):
     assert [r.payload["i"] for r in b.fetch_new()] == [99]
 
 
-def test_unpushed_records_survive_a_rewrite(participant):
-    """다른 참가자가 압축하는 사이 내 미푸시 레코드가 있어도 살아남는다."""
+def test_unpushed_work_survives_a_rewrite(participant):
+    """다른 참가자가 압축해도 내 미푸시분이 살아남는다 — **두 종류 다.**
+
+    ⭐ 레코드는 이제 push 될 때까지 **메모리 대기열**에 있다(디스크·커밋 어디에도
+    없다). 그래서 재작성에 휩쓸릴 수 있는 미푸시 *커밋*은 **참가자 상태**뿐이고,
+    대기열 쪽은 "재작성 뒤에도 그대로 나가는가"가 관심사다. 둘을 함께 본다.
+    """
     a = participant("alice")
     b = participant("bob", batch_window=60.0)  # push 를 늦춘다
     a.append({"who": "alice"}, flush=True)
 
-    b.append({"who": "bob-unpushed"})          # 커밋도 push 도 아직
+    b.write_state("bob@localhost", {"cursor": "c1"})
     b._absorb_worktree()                       # 커밋만 하고 push 는 안 한 상태
+    b.append({"who": "bob-queued"})            # 대기열 (커밋도 push 도 아직)
     a.compact(confirm=True)
 
     b.sync()                                    # 재작성 감지 → 미푸시분 재적용
@@ -93,7 +99,9 @@ def test_unpushed_records_survive_a_rewrite(participant):
 
     c = participant("carol")
     who = sorted(r.payload["who"] for r in c.fetch_new())
-    assert who == ["alice", "bob-unpushed"], "미푸시 레코드가 재작성에 휩쓸렸다"
+    assert who == ["alice", "bob-queued"], "대기열이 재작성에 휩쓸렸다"
+    state = b.read_state("bob@localhost", fresh=True)
+    assert state is not None and state.value == {"cursor": "c1"}
 
 
 def test_rewrite_without_recovery_marker_refuses_to_destroy(participant):
@@ -103,7 +111,9 @@ def test_rewrite_without_recovery_marker_refuses_to_destroy(participant):
     a.append({"i": 0}, flush=True)
     b.fetch_new()
 
-    b.append({"i": 1})
+    # 미푸시 **커밋**을 만든다. 레코드는 대기열에 있어 커밋이 되지 않으므로
+    # (push 때 커밋된다) 예약 경로 쪽 쓰기를 쓴다.
+    b.write_state("bob@localhost", {"cursor": "c1"})
     b._absorb_worktree()
     # 복구 마커를 지워 "미푸시분을 어디서부터 옮겨야 할지" 알 수 없게 만든다
     b.git.run("update-ref", "-d", "refs/gitwire/pushed", check=False)
