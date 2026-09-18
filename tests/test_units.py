@@ -11,7 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from gitwire import clock, credentials, gitcmd, identity, layout, records, rollup
+from gitwire import (
+    clock, credentials, gitcmd, identity, layout, localrefs, records, rollup,
+)
 from gitwire.treecache import TreeCache
 from gitwire.cursor import Cursor, CursorStore
 from gitwire.errors import AuthError, GitError, PushRejected
@@ -577,3 +579,227 @@ def test_tree_cache_can_be_disabled():
     assert cache.put("a", ["1"]) == ["1"]         # 값은 그대로 돌려준다
     assert cache.get("a") is None                 # 담지는 않는다
     assert cache.info()["entries"] == 0
+
+
+# ------------------------- ref 를 `.git` 에서 직접 읽고 쓴다 (git 프로세스 0개)
+#
+# ⚠️ 여기서 지켜야 하는 것은 속도가 아니라 **"모른다"를 "없다"로 번역하지 않는
+# 것**이다. 그 오역이 곧 조용한 유실이다 (`localrefs.ref_sha` 도크).
+
+
+def _repo(path: Path) -> None:
+    for args in (
+        ["init", "-q", "-b", "main", "."],
+        ["config", "user.email", "t@localhost"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", *args], cwd=str(path), check=True, capture_output=True)
+
+
+def _commit_one(path: Path) -> str:
+    (path / "f").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "add", "-A"], cwd=str(path), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=str(path), check=True,
+                   capture_output=True)
+    res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(path), check=True,
+                         capture_output=True, text=True)
+    return res.stdout.strip()
+
+
+def test_ref_sha_says_unborn_when_the_branch_has_no_commit(tmp_path):
+    _repo(tmp_path)
+    assert localrefs.ref_sha(tmp_path) == (True, None)      # 없다 (모른다가 아니다)
+
+
+def test_ref_sha_matches_rev_parse_loose_packed_and_detached(tmp_path):
+    _repo(tmp_path)
+    want = _commit_one(tmp_path)
+
+    assert localrefs.ref_sha(tmp_path) == (True, want)       # loose ref
+    subprocess.run(["git", "pack-refs", "--all"], cwd=str(tmp_path), check=True,
+                   capture_output=True)
+    assert localrefs.ref_sha(tmp_path) == (True, want)       # packed-refs
+    subprocess.run(["git", "checkout", "-q", "--detach", "HEAD"], cwd=str(tmp_path),
+                   check=True, capture_output=True)
+    assert localrefs.ref_sha(tmp_path) == (True, want)       # detached HEAD
+
+
+def test_ref_sha_refuses_to_guess_for_shapes_it_does_not_know(tmp_path):
+    """`.git` 이 디렉토리가 아니거나 reftable 이면 **모른다**고 답한다."""
+    assert localrefs.ref_sha(tmp_path / "nope") == (False, None)
+    _repo(tmp_path)
+    (tmp_path / ".git" / "reftable").mkdir()
+    assert localrefs.ref_sha(tmp_path) == (False, None)
+    assert localrefs.ref_sha(tmp_path, "refs/heads/../../evil") == (False, None)
+
+
+def test_write_ref_is_visible_to_git(tmp_path):
+    _repo(tmp_path)
+    sha = _commit_one(tmp_path)
+    assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", sha) is True
+    res = subprocess.run(["git", "rev-parse", "refs/gitwire/pushed"],
+                         cwd=str(tmp_path), check=True, capture_output=True, text=True)
+    assert res.stdout.strip() == sha
+    assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", sha) is True  # 덮어쓰기
+    assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", "nope") is False
+    assert localrefs.write_ref(tmp_path, "../evil", sha) is False
+
+
+def test_write_ref_does_not_steal_someone_elses_lock(tmp_path):
+    """⚠️ 남의 `<ref>.lock` 을 치우면 그쪽 ref 갱신이 깨진다 — 손대지 않고 폴백."""
+    _repo(tmp_path)
+    lock = tmp_path / ".git" / "refs" / "gitwire" / "pushed.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text("someone else", encoding="utf-8")
+    assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", "0" * 40) is False
+    assert lock.read_text(encoding="utf-8") == "someone else"
+
+
+# ------------------- 자격증명을 기동 시 1회 조회해 메모리로 들고 env 로 먹인다
+
+
+def test_config_env_appends_after_an_existing_count(monkeypatch):
+    """⚠️ 0번부터 덮어쓰면 호출자가 그 규약으로 넘긴 설정을 조용히 지운다."""
+    monkeypatch.setenv(gitcmd.CONFIG_COUNT_ENV, "2")
+    env = gitcmd._config_env((("a.b", "c"),))
+    assert env[gitcmd.CONFIG_COUNT_ENV] == "3"
+    assert env["GIT_CONFIG_KEY_2"] == "a.b" and env["GIT_CONFIG_VALUE_2"] == "c"
+    assert "GIT_CONFIG_KEY_0" not in env
+
+
+def test_remote_scope_is_only_for_http_remotes():
+    assert gitcmd._remote_scope("https://github.com/me/room.git") == (
+        "https", "github.com", "https://github.com/me/room.git"
+    )
+    # ⚠️ URL 에 박힌 자격증명 조각은 스코프·조회 키에 섞지 않는다.
+    assert gitcmd._remote_scope("https://u:p@github.com/me/room.git")[2] == (
+        "https://github.com/me/room.git"
+    )
+    assert gitcmd._remote_scope("git@github.com:me/room.git") is None
+    assert gitcmd._remote_scope("C:/tmp/origin.git") is None
+    assert gitcmd._remote_scope("") is None
+
+
+def test_held_credential_goes_into_env_only_and_never_into_repr():
+    held = gitcmd.HeldCredential(
+        "https://github.com/me/room.git", "Authorization: Basic c2VjcmV0",
+        ("tok3n-value", "c2VjcmV0"),
+    )
+    env = held.env()
+    assert env["GIT_CONFIG_KEY_0"] == "credential.helper"
+    assert env["GIT_CONFIG_VALUE_0"] == ""          # 목록을 비운다
+    assert env["GIT_CONFIG_KEY_1"] == (
+        "http.https://github.com/me/room.git.extraHeader"
+    )
+    assert env["GIT_CONFIG_VALUE_1"] == "Authorization: Basic c2VjcmV0"
+    assert "c2VjcmV0" not in repr(held) and "c2VjcmV0" not in str(held)
+
+
+def test_local_remotes_never_shell_out_to_credential_fill(monkeypatch):
+    """로컬 경로·ssh 원격에서는 조회 자체가 일어나지 않는다 (테스트가 그 경로다)."""
+    def boom(*a, **kw):                             # pragma: no cover
+        raise AssertionError("credential fill 을 불렀다")
+
+    monkeypatch.setattr(gitcmd, "_fill", boom)
+    assert gitcmd.credential_env("git", "C:/tmp/origin.git") is None
+    assert gitcmd.credential_env("git", "git@github.com:me/room.git") is None
+
+
+def test_held_credential_is_fetched_once_per_host(monkeypatch):
+    calls = []
+
+    def fake_fill(git_path, cwd, protocol, host):
+        calls.append((protocol, host))
+        return {"username": "u", "password": "tok3n"}
+
+    monkeypatch.setattr(gitcmd, "_fill", fake_fill)
+    gitcmd.reset_credential_state()
+    a = gitcmd.credential_env("git", "https://github.com/me/one.git")
+    b = gitcmd.credential_env("git", "https://github.com/me/two.git")
+    assert calls == [("https", "github.com")], "호스트당 한 번이 아니다"
+    # 같은 조회를 재사용하되 스코프는 그 원격으로 좁혀 준다.
+    assert a.scope == "https://github.com/me/one.git"
+    assert b.scope == "https://github.com/me/two.git"
+    assert a.header == b.header
+
+
+def test_held_credential_falls_back_when_nothing_is_stored(monkeypatch):
+    """못 얻으면 None — 그 뒤는 헬퍼 단계가 받는다 (느린 게 실패보다 낫다)."""
+    monkeypatch.setattr(gitcmd, "_fill", lambda *a: {})
+    gitcmd.reset_credential_state()
+    assert gitcmd.credential_env("git", "https://github.com/me/room.git") is None
+
+
+def test_held_credential_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(gitcmd, "_fill", lambda *a: {"password": "tok3n"})
+    monkeypatch.setenv(gitcmd.HELD_ENV, "off")
+    gitcmd.reset_credential_state()
+    assert gitcmd.credential_env("git", "https://github.com/me/room.git") is None
+
+
+def test_credential_tiers_are_held_then_helper_then_user_config(monkeypatch):
+    monkeypatch.setattr(gitcmd, "_fill", lambda *a: {"username": "u",
+                                                     "password": "tok3n"})
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "!echo")
+    gitcmd.reset_credential_state()
+    g = gitcmd.Git(FakeRunner(gitcmd.GitResult(0, "", "")), Path("."),
+                   remote_url="https://github.com/me/room.git")
+    tiers = g._credential_tiers(["push", "origin", "main"])
+    assert [bool(t.env) for t in tiers] == [True, False, False]
+    assert [bool(t.prefix) for t in tiers] == [False, True, False]
+    # 로컬 호출은 한 단계 — 동작이 한 글자도 바뀌지 않는다.
+    assert len(g._credential_tiers(["commit", "-m", "x"])) == 1
+
+
+def test_auth_failure_walks_down_to_the_user_config(monkeypatch):
+    """들고 있던 것 → 헬퍼 → 사용자 설정. 각 단계는 인증 실패에만 내려간다."""
+    monkeypatch.setattr(gitcmd, "_fill", lambda *a: {"username": "u",
+                                                     "password": "tok3n"})
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "!echo")
+    gitcmd.reset_credential_state()
+    seen = []
+
+    class Walker:
+        git_path = "git"
+
+        def run(self, args, *, cwd=None, env=None, timeout=None):
+            has_header = any(
+                key.startswith("GIT_CONFIG_VALUE_")
+                and str(value).startswith("Authorization:")
+                for key, value in (env or {}).items()
+            )
+            has_helper = "credential.helper=!echo" in args
+            seen.append("held" if has_header else
+                        ("helper" if has_helper else "plain"))
+            if has_header or has_helper:
+                return gitcmd.GitResult(
+                    128, "",
+                    "fatal: could not read Username: terminal prompts disabled",
+                )
+            return gitcmd.GitResult(0, "ok", "")
+
+    g = gitcmd.Git(Walker(), Path("."), remote_url="https://github.com/me/room.git")
+    assert g.run("push", "origin", "main").stdout == "ok"
+    assert seen == ["held", "helper", "plain"], seen
+    # 접혔으므로 다음 호출은 바로 사용자 설정이다 — 왕복마다 실패를 되풀이하지 않는다.
+    seen.clear()
+    g.run("push", "origin", "main")
+    assert seen == ["plain"], seen
+
+
+def test_the_held_secret_is_registered_for_redaction(monkeypatch):
+    """⚠️ git 이 그 값을 되뱉어도 stdout·stderr·예외에 나타나지 않아야 한다."""
+    monkeypatch.setattr(gitcmd, "_fill", lambda *a: {"username": "u",
+                                                     "password": "tok3n-secret"})
+    monkeypatch.delenv(gitcmd.HELPER_ENV, raising=False)
+    gitcmd.reset_credential_state()
+    runner = FakeRunner(gitcmd.GitResult(1, "", "fatal: tok3n-secret is bad"))
+    g = gitcmd.Git(runner, Path("."), remote_url="https://github.com/me/room.git")
+    res = g.run("push", "origin", "main", check=False)
+    assert "tok3n-secret" not in res.stderr and "***" in res.stderr
+    with pytest.raises(GitError) as err:
+        g.run("push", "origin", "main")
+    assert "tok3n-secret" not in str(err.value)
+    # 그리고 명령줄에는 애초에 실리지 않는다 (env 로만 간다).
+    assert not any("tok3n-secret" in " ".join(call) for call in runner.calls)

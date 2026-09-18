@@ -8,10 +8,12 @@
   redact() 가 모든 출력 경로에서 강제된다.
 * 대화형 프롬프트를 원천 차단한다 (GIT_TERMINAL_PROMPT=0). 헤드리스에서
   git 이 자격증명을 물으며 멈추는 것이 최악의 실패 모드다.
-* **자격증명 조회를 싸게 만든다** — 네트워크 호출에만 OS 기본 저장소 헬퍼를
-  얹는다 (`credential_config()`. 실측 −330ms/왕복). 사용자의 전역 설정은
-  읽지도 고치지도 않고, 그 헬퍼가 없거나 인증이 안 되면 **사용자 설정으로
-  되돌린다**(로그를 남긴다 — 조용한 열화 금지).
+* **자격증명을 왕복마다 다시 조회하지 않는다** — 원격 호스트별로 **한 번**
+  `git credential fill` 로 받아 이 프로세스 메모리에 들고, 이후의 네트워크
+  호출에는 그 값을 **환경변수로** 먹인다 (`credential_env()`. 실측 −607ms/왕복,
+  헬퍼 기동 2회 → 0회). 그 조회가 안 되면 OS 저장소 헬퍼를 얹고
+  (`credential_config()`), 그것도 안 되면 **사용자 설정 그대로** 쓴다 — 세 단계
+  전부 로그를 남긴다 (조용한 열화 금지). 사용자의 전역 설정은 읽기만 한다.
 * **Windows 에서 콘솔 창을 띄우지 않는다** (`creation_flags`). 아래 참조.
 
 Windows — 왜 창 억제 플래그가 필요한가
@@ -45,6 +47,7 @@ Windows — 왜 창 억제 플래그가 필요한가
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -52,9 +55,9 @@ import shutil
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping, Protocol, Sequence
+from typing import Callable, Iterable, Mapping, Protocol, Sequence
 
 from .errors import AuthError, GitError, PushRejected
 
@@ -144,8 +147,17 @@ def _helper_installed(name: str, git_path: str) -> bool:
 def credential_config(git_path: str = "git") -> tuple[str, ...]:
     """네트워크 git 호출에 얹을 `-c credential.helper=…` 인자 (없으면 빈 튜플).
 
-    왜 — 실측 (Windows 11 · git 2.51 · GitHub private repo · `push --dry-run`
-    5회, 중앙값)::
+    ⭐ **이것은 이제 2단이다.** 1단은 아래 `credential_env()` — 자격증명을 기동 시
+    한 번 읽어 메모리에 들고 쓰는 쪽이고, 그게 되면 헬퍼가 아예 뜨지 않는다
+    (−607ms/왕복). 이 함수가 받는 것은 그 조회가 **안 되는** 환경이다:
+
+    * `credential.useHttpPath=true` 처럼 호스트만으로는 조회가 안 되는 설정 —
+      `git credential fill` 은 빈손으로 오지만 git 자신의 push 중 조회(경로까지
+      포함)는 성공한다. 이 단계가 그 사람의 유일한 경로다.
+    * Basic 헤더를 받지 않는 서버 (사내 게이트웨이·Negotiate 강제).
+
+    그 환경에서는 아래 표가 그대로 유효하다 — 실측 (Windows 11 · git 2.51 ·
+    GitHub private repo · `push --dry-run` 5회, 중앙값)::
 
         사용자 설정 그대로 (system: manager = GCM)      1552 ms
         wincred 만                                      1220 ms
@@ -213,6 +225,9 @@ def reset_credential_state() -> None:
     with _cred_lock:
         _cred_cache.clear()
         _cred_disabled.clear()
+    with _held_lock:
+        _held_cache.clear()
+        _held_disabled.clear()
 
 
 def disable_credential_config(git_path: str, reason: str) -> None:
@@ -232,6 +247,220 @@ def disable_credential_config(git_path: str, reason: str) -> None:
         "gitwire: 자격증명 헬퍼 %r 로 인증하지 못했다 (%s) — "
         "사용자 git 설정으로 되돌려 다시 시도한다",
         name,
+        reason,
+    )
+
+
+# ------------------------------------------------ 기동 시 1회 조회 (메모리 보유)
+#
+# ⭐ **전송 비용의 가장 큰 항목이 여기였다.**
+#
+# 위 `credential_config()` 는 *어느 헬퍼를 쓸까*를 고르는 일이다. 그런데 어느
+# 헬퍼를 고르든 **왕복마다 헬퍼 프로세스가 두 번 뜬다** (`get` · `store`). 실측
+# (Windows 11 · git 2.51 · GitHub private repo · `push --dry-run` 3회 중앙값,
+# `GIT_TRACE` 로 `git-credential-*` exec 계수)::
+#
+#     사용자 설정 그대로 (system: manager)   1532 ms   헬퍼 exec 2회
+#     wincred 만 (credential_config 의 값)   1258 ms   헬퍼 exec 2회
+#     아래 방식 (메모리 보유 + env)            651 ms   헬퍼 exec 0회
+#
+# 즉 헬퍼를 바꿔 깎을 수 있는 것은 이미 다 깎았고, **남은 ~607ms 는 헬퍼 기동
+# 그 자체**다. 그것을 0 으로 만드는 길은 하나뿐이다 — 자격증명을 **한 번** 받아
+# 들고 있다가 직접 먹이는 것. `git credential fill` 은 이 머신에서 422~716ms
+# 이고, 그 비용을 **기동 시 딱 한 번** 낸다.
+#
+# ⚠️ **새 토큰을 만들지 않는다.** 사용자가 이미 저장해 둔 자격증명을 그 사람의
+# 헬퍼 사슬에게 정상적으로 물어보는 것뿐이다. 저장소에 쓰지도 않는다.
+#
+# ⚠️ **어떻게 먹이나 — argv 는 절대 아니다.** 이 OS 에서 남의 프로세스 명령줄은
+# 그대로 읽힌다(`Win32_Process.CommandLine`). URL 에 박으면 `.git/config` 와
+# 에러 메시지에까지 남는다. 그래서 git 이 제공하는 **설정을 환경변수로 주는
+# 규약**(`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`)을 쓴다:
+#
+#     http.<원격 URL>.extraHeader = Authorization: Basic <base64>
+#     credential.helper           = (빈 값 — 목록을 비운다)
+#
+# 헤더가 붙으면 서버가 401 을 주지 않으므로 git 은 자격증명을 **물어볼 이유가
+# 없다** (그래서 헬퍼 exec 0회이고, 401→재시도 왕복도 사라져 −607ms 가 된다).
+# 스코프를 `http.<그 원격 URL>.` 로 좁히므로 리다이렉트로 다른 호스트에 갔을 때
+# 그 헤더가 따라가지 않는다.
+#
+# ⚠️ **안 되면 떨어진다.** 조회가 실패하거나(저장된 것이 없다·
+# `credential.useHttpPath` 처럼 호스트만으로는 못 찾는 설정), http(s) 가 아닌
+# 원격이거나(ssh·로컬 경로 — 애초에 이 얘기가 아니다), 그 헤더로 인증이 거부되면
+# `credential_config()` → 사용자 설정 순으로 내려간다. 느린 것이 깨지는 것보다
+# 낫고, 어느 단계로 내려갔는지 **로그에 남는다.**
+
+#: git 설정을 argv 가 아니라 환경변수로 주는 규약의 개수 변수.
+CONFIG_COUNT_ENV = "GIT_CONFIG_COUNT"
+
+#: 기동 시 1회 조회를 끈다 (`off`/`0`/`no`/`none`/`false`/`""`). 진단용.
+HELD_ENV = "GITWIRE_HELD_CREDENTIAL"
+
+#: http(s) 원격에서 (프로토콜, 호스트, 경로) 를 뽑는다. `user@` 는 버린다 —
+#: 스코프·조회 키에 자격증명 조각을 섞지 않는다.
+_HTTP_RE = re.compile(r"\A(https?)://(?:[^/@]*@)?([^/?#]+)([^?#]*)", re.I)
+
+_held_lock = threading.Lock()
+_held_cache: dict[str, "HeldCredential | None"] = {}
+#: 이 헤더로 인증이 거부된 원격. 이 프로세스에서는 다시 시도하지 않는다.
+_held_disabled: set[str] = set()
+
+
+@dataclass(frozen=True)
+class HeldCredential:
+    """원격 하나의 자격증명 — **이 프로세스 메모리에만** 있다. 디스크에 안 쓴다."""
+
+    scope: str
+    """`http.<여기>.extraHeader` 의 스코프 (그 원격 URL)."""
+    header: str
+    """`Authorization: …` 값. **비밀을 품는다** — 로그·repr 에 싣지 않는다."""
+    secrets: tuple[str, ...] = field(default=())
+    """`redact()` 에 넘길 값들 (비밀번호 원문 + base64 블롭 둘 다)."""
+
+    def env(self) -> dict[str, str]:
+        """git 에 먹일 환경변수. 호출자는 이것을 `env` 로만 넘긴다."""
+        return _config_env((
+            ("credential.helper", ""),
+            (f"http.{self.scope}.extraHeader", self.header),
+        ))
+
+    def __repr__(self) -> str:
+        return f"HeldCredential(scope={self.scope!r}, header=***)"
+
+    __str__ = __repr__
+
+
+def _config_env(pairs: Sequence[tuple[str, str]]) -> dict[str, str]:
+    """`(키, 값)` 들을 git 의 `GIT_CONFIG_*` 환경변수로 만든다.
+
+    ⚠️ 이미 환경에 `GIT_CONFIG_COUNT` 가 있으면 그 **뒤에 이어 붙인다.** 0번부터
+    덮어쓰면 호출자가 그 규약으로 넘긴 설정을 조용히 지운다.
+    """
+    try:
+        base = int(os.environ.get(CONFIG_COUNT_ENV, "") or "0")
+    except ValueError:
+        base = 0
+    base = max(0, base)
+    env = {CONFIG_COUNT_ENV: str(base + len(pairs))}
+    for i, (key, value) in enumerate(pairs, start=base):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
+
+
+def _remote_scope(url: str) -> tuple[str, str, str] | None:
+    """http(s) 원격의 (프로토콜, 호스트, 스코프 URL). 아니면 None."""
+    m = _HTTP_RE.match((url or "").strip())
+    if not m:
+        return None
+    protocol, host, path = m.group(1).lower(), m.group(2), m.group(3) or ""
+    return protocol, host, f"{protocol}://{host}{path}"
+
+
+def _fill(git_path: str, cwd: Path | None, protocol: str, host: str) -> dict[str, str]:
+    """`git credential fill` 한 번. 못 얻으면 빈 dict.
+
+    ⚠️ `GitRunner` 를 타지 않는다 — stdin 을 줘야 하고, 이 조회는 러너를 갈아끼운
+    테스트에서 **일어나서는 안 되는** 일이다 (네트워크·머신 설정 의존).
+    호출 자체가 http(s) 원격에서만 일어나므로 테스트의 로컬 경로 원격은 여기에
+    도달하지 않는다.
+    """
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    try:
+        res = subprocess.run(
+            [git_path, "credential", "fill"],
+            input=f"protocol={protocol}\nhost={host}\n\n".encode(),
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            capture_output=True,
+            timeout=60,
+            creationflags=creation_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if res.returncode != 0:
+        return {}
+    out: dict[str, str] = {}
+    for line in res.stdout.decode("utf-8", "replace").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            out[key.strip()] = value
+    return out
+
+
+def credential_env(
+    git_path: str = "git", url: str = "", cwd: Path | None = None
+) -> HeldCredential | None:
+    """이 원격에 쓸 **메모리 보유 자격증명** (없으면 None).
+
+    원격 **호스트별로 한 번만** 조회한다 — 같은 호스트의 다른 채널·다른 왕복은
+    그 결과를 그대로 쓴다. 조회 결과가 "없음"인 것도 캐시한다(호출마다 768ms 를
+    다시 내지 않는다).
+    """
+    forced = os.environ.get(HELD_ENV)
+    if forced is not None and forced.strip().lower() in _OFF:
+        return None
+    scoped = _remote_scope(url)
+    if scoped is None:
+        return None                       # ssh·로컬 경로 — 이 얘기가 아니다
+    protocol, host, scope = scoped
+    key = f"{git_path}\x00{protocol}://{host}"
+    with _held_lock:
+        if key in _held_disabled:
+            return None
+        if key in _held_cache:
+            hit = _held_cache[key]
+            # 같은 호스트의 다른 경로면 스코프만 갈아 쓴다 (조회는 재사용).
+            if hit is None or hit.scope == scope:
+                return hit
+            return HeldCredential(scope, hit.header, hit.secrets)
+    filled = _fill(git_path, cwd, protocol, host)
+    user, password = filled.get("username", ""), filled.get("password", "")
+    held: HeldCredential | None = None
+    if password:
+        blob = base64.b64encode(f"{user}:{password}".encode()).decode("ascii")
+        held = HeldCredential(scope, f"Authorization: Basic {blob}", (password, blob))
+    with _held_lock:
+        first = key not in _held_cache
+        _held_cache[key] = held
+    if first:
+        if held is None:
+            log.info(
+                "gitwire: %s://%s 의 저장된 자격증명을 얻지 못했다 — "
+                "git 의 자격증명 헬퍼를 그대로 쓴다 (왕복마다 헬퍼가 뜬다)",
+                protocol,
+                host,
+            )
+        else:
+            log.info(
+                "gitwire: %s://%s 자격증명을 한 번 조회해 메모리에 들었다 — "
+                "이후 왕복에서 헬퍼를 띄우지 않는다",
+                protocol,
+                host,
+            )
+    return held
+
+
+def disable_held_credential(git_path: str, url: str, reason: str) -> None:
+    """들고 있던 자격증명으로 인증이 거부됐다 — 접고 헬퍼 경로로 내려간다."""
+    scoped = _remote_scope(url)
+    if scoped is None:
+        return
+    protocol, host, _ = scoped
+    key = f"{git_path}\x00{protocol}://{host}"
+    with _held_lock:
+        if key in _held_disabled:
+            return
+        _held_disabled.add(key)
+        _held_cache.pop(key, None)
+    log.warning(
+        "gitwire: 메모리에 든 %s://%s 자격증명으로 인증하지 못했다 (%s) — "
+        "git 의 자격증명 헬퍼로 되돌려 다시 시도한다",
+        protocol,
+        host,
         reason,
     )
 
@@ -372,6 +601,24 @@ def subcommand_of(args: Sequence[str]) -> str | None:
     return None
 
 
+@dataclass(frozen=True)
+class _Tier:
+    """자격증명 경로 한 단계 — 무엇을 얹고, 실패하면 무엇을 접나.
+
+    세 단계가 이 한 모양으로 표현된다 (`Git._credential_tiers`): 메모리 보유
+    자격증명(env) → OS 저장소 헬퍼(`-c`) → 사용자 설정(아무것도 안 얹음).
+    """
+
+    prefix: tuple[str, ...]
+    """git 인자 앞에 붙일 `-c …` 들."""
+    env: Mapping[str, str]
+    """이 호출에만 덧씌울 환경변수 (자격증명은 **여기로만** 간다)."""
+    secrets: tuple[str, ...]
+    """`redact()` 대상으로 등록할 값들."""
+    disable: Callable[[str], None] | None
+    """인증이 거부됐을 때 이 단계를 접는 함수 (마지막 단계는 None)."""
+
+
 class Git:
     """특정 작업 디렉토리에 묶인 git 실행 헬퍼.
 
@@ -387,12 +634,17 @@ class Git:
         secrets: Sequence[str] = (),
         timeout: float | None = 120.0,
         cheap_credentials: bool = True,
+        remote_url: str | None = None,
     ) -> None:
         self.runner = runner
         self.cwd = Path(cwd)
         self.env = dict(env or {})
         self.secrets = tuple(secrets)
         self.timeout = timeout
+        # 네트워크 호출의 원격 URL. 있으면 그 호스트의 **저장된** 자격증명을
+        # 기동 시 1회 조회해 메모리로 들고 쓴다 (`credential_env`). None 이면
+        # 그 경로를 쓰지 않는다 — 호출자가 자기 자격증명을 직접 주는 경우다.
+        self.remote_url = remote_url
         # False = 자격증명 설정을 우리가 얹지 않는다 (호출자가 스스로 관리한다 —
         # 예: `Channel(credential_helpers=…)` 로 사슬을 직접 짠 경우. 그때 우리가
         # 목록을 초기화해 버리면 그 설정이 무효가 된다).
@@ -406,23 +658,52 @@ class Git:
             secrets=self.secrets,
             timeout=self.timeout,
             cheap_credentials=self.cheap_credentials,
+            remote_url=self.remote_url,
         )
 
-    def _credential_args(self, args: Sequence[str]) -> tuple[str, ...]:
-        """이 호출에 얹을 자격증명 설정 (네트워크 호출에만 · 실패하면 빈 튜플)."""
-        if not self.cheap_credentials:
-            return ()
-        if subcommand_of(args) not in NETWORK_CMDS:
-            return ()
-        return credential_config(runner_git_path(self.runner))
+    def _credential_tiers(self, args: Sequence[str]) -> list["_Tier"]:
+        """이 호출에 시도할 자격증명 경로들 — **싼 쪽부터, 마지막은 사용자 설정.**
+
+        네트워크 호출이 아니면 한 칸(아무것도 얹지 않음)이다. 로컬 git 호출의
+        동작을 한 글자도 바꾸지 않기 위해서다.
+
+        앞 단계가 **인증 실패**로 끝나면 다음 단계로 내려간다(`run`). 그것이
+        "못 얻으면 사용자 설정 그대로 떨어진다"의 구현이고, 내려갈 때마다 로그가
+        남는다 — 조용한 열화 금지.
+        """
+        plain = _Tier((), {}, (), None)
+        if not self.cheap_credentials or subcommand_of(args) not in NETWORK_CMDS:
+            return [plain]
+        git_path = runner_git_path(self.runner)
+        tiers: list[_Tier] = []
+        if self.remote_url:
+            held = credential_env(git_path, self.remote_url, self.cwd)
+            if held is not None:
+                url = self.remote_url
+                tiers.append(_Tier(
+                    (), held.env(), held.secrets,
+                    lambda why: disable_held_credential(git_path, url, why),
+                ))
+        cfg = credential_config(git_path)
+        if cfg:
+            tiers.append(_Tier(
+                cfg, {}, (),
+                lambda why: disable_credential_config(git_path, why),
+            ))
+        tiers.append(plain)
+        return tiers
 
     def _invoke(
-        self, prefix: Sequence[str], args: Sequence[str], timeout: float | None
+        self,
+        prefix: Sequence[str],
+        args: Sequence[str],
+        timeout: float | None,
+        env: Mapping[str, str] | None = None,
     ) -> GitResult:
         res = self.runner.run(
             [*prefix, *BASE_CONFIG, *args],
             cwd=self.cwd,
-            env=self.env,
+            env={**self.env, **(env or {})},
             timeout=timeout,
         )
         return GitResult(
@@ -435,16 +716,24 @@ class Git:
         self, *args: str, check: bool = True, timeout: float | None = None
     ) -> GitResult:
         timeout = timeout or self.timeout
-        cred = self._credential_args(args)
-        res = self._invoke(cred, args, timeout)
-        if cred and res.returncode != 0 and _is_auth_failure(res):
-            # ⭐ 우리가 지정한 저장소에 자격증명이 없었다 (예: GCM 전용 저장소만
-            # 쓰는 사람). 조용히 깨뜨리지 않는다 — 접고, 사용자 설정 그대로 한 번
-            # 더 시도한다. 이 프로세스에서는 다음 호출부터 바로 사용자 설정을 쓴다.
-            disable_credential_config(
-                runner_git_path(self.runner), res.stderr.strip()[:200] or "인증 실패"
-            )
-            res = self._invoke((), args, timeout)
+        tiers = self._credential_tiers(args)
+        # ⭐ 들고 있는 비밀은 **레닥션 대상에 등록한다.** `_invoke` 와 아래 예외
+        # 경로가 전부 `self.secrets` 로 가리므로, 만약 git 이 그 값을 되뱉어도
+        # stdout·stderr·예외 메시지에 나타나지 않는다.
+        extra = tuple(s for tier in tiers for s in tier.secrets)
+        if extra:
+            self.secrets = tuple(dict.fromkeys((*self.secrets, *extra)))
+        res = self._invoke(tiers[0].prefix, args, timeout, tiers[0].env)
+        for i in range(1, len(tiers)):
+            if res.returncode == 0 or not _is_auth_failure(res):
+                break
+            # ⭐ 이 단계로는 인증이 안 된다. 조용히 깨뜨리지 않는다 — 접고(이
+            # 프로세스에서는 다음 호출부터 바로 다음 단계로 간다) 한 단계 내려가
+            # 다시 시도한다.
+            disable = tiers[i - 1].disable
+            if disable is not None:
+                disable(res.stderr.strip()[:200] or "인증 실패")
+            res = self._invoke(tiers[i].prefix, args, timeout, tiers[i].env)
         if check and res.returncode != 0:
             low = (res.stderr + res.stdout).lower()
             safe_args = [redact(a, self.secrets) for a in args]

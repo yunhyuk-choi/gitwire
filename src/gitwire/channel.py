@@ -138,6 +138,24 @@ def credential_cache(
 
 
 @dataclass(frozen=True)
+class _Absorb:
+    """한 커밋으로 흡수할 것 — 무엇을 스테이징하고 무엇을 대기에서 걷어내나.
+
+    이 값이 **락 안에서 정해지고 락 밖에서 쓰인다**는 것이 요점이다
+    (`Channel._absorb_plan` → `_commit_plan` → `_absorb_done`).
+    """
+
+    specs: tuple[str, ...]
+    """`git add -A --` 에 줄 pathspec 들."""
+    message: str
+    """커밋 메시지 (이번에 담은 건수를 적는다)."""
+    records: tuple[str, ...]
+    """이번에 찍은 레코드 경로들. **비어 있지 않으면 커밋될 것이 반드시 있다.**"""
+    states: frozenset[str]
+    """이번에 함께 실어 보내는 참가자 상태 경로들."""
+
+
+@dataclass(frozen=True)
 class HistoryPage:
     """역방향 페이징 한 쪽.
 
@@ -471,14 +489,23 @@ class Channel:
     # ------------------------------------------------------------------ git
 
     def _git(self, cwd: Path | None = None) -> Git:
+        env = self.credential.env(self.dir)
         return Git(
             self._runner,
             cwd or self.clone_dir,
-            env=self.credential.env(self.dir),
+            env=env,
             secrets=self.credential.secrets(),
             # 자격증명 사슬을 이 채널이 직접 짰으면(`credential_helpers=…`)
             # gitcmd 가 목록을 초기화하지 않게 한다 — 그러면 그 설정이 무효가 된다.
             cheap_credentials=self.credential_helpers is None,
+            # ⭐ 원격 URL 을 주면 gitcmd 가 그 호스트의 **저장된** 자격증명을 한 번
+            # 조회해 메모리로 들고 쓴다 (왕복마다 헬퍼가 뜨는 것을 없앤다).
+            #
+            # ⚠️ 이 채널이 **자기 자격증명을 들고 있으면**(`TokenCredential` —
+            # `env()` 가 비어 있지 않다) 주지 않는다. 그 사람은 "이 채널은 이
+            # 토큰으로 붙어라"라고 말한 것이므로, 우리가 OS 저장소의 다른
+            # 자격증명으로 붙으면 **지시를 조용히 무시**하는 셈이다.
+            remote_url=None if env else self.repo_url,
         )
 
     @property
@@ -601,7 +628,25 @@ class Channel:
         return self._localrefs.resolve("HEAD", self._resolve_head)
 
     def _resolve_head(self) -> str | None:
-        res = self.git.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+        return self._ref_sha("HEAD")
+
+    def _ref_sha(self, name: str) -> str | None:
+        """ref 의 sha — **`.git` 파일을 직접 읽고**, 못 읽으면 git 에게 묻는다.
+
+        ⭐ 캐시(`localrefs.LocalRefCache`)가 없애는 것은 *유휴에서* 도는
+        `rev-parse` 다. 전송 경로에서는 우리가 방금 커밋을 했으므로 캐시가 무효라
+        매번 프로세스가 떴다 — 전송 한 번에 `rev-parse` **2회 · 189ms**(실측).
+        그 두 번이 하는 일은 41바이트 파일 한 개를 읽는 것이고, 그건 우리가
+        직접 할 수 있다 (`localrefs.ref_sha` — 프로세스 0개, 0.1ms 미만).
+
+        ⚠️ **"모른다"와 "없다"를 섞지 않는다.** `ref_sha` 가 판정을 못 하면
+        (`.git` 이 워크트리 파일·`reftable` 백엔드·읽기 실패) 예전 그대로
+        `rev-parse` 를 부른다. 느려질 뿐 틀리지 않는다.
+        """
+        known, sha = _localrefs.ref_sha(self.clone_dir, name)
+        if known:
+            return sha
+        res = self.git.run("rev-parse", "--verify", "--quiet", name, check=False)
         return res.stdout.strip() or None
 
     def _remote_ref(self) -> str | None:
@@ -615,11 +660,7 @@ class Channel:
         )
 
     def _resolve_remote_ref(self) -> str | None:
-        res = self.git.run(
-            "rev-parse", "--verify", "--quiet",
-            f"refs/remotes/origin/{self.branch}", check=False,
-        )
-        return res.stdout.strip() or None
+        return self._ref_sha(f"refs/remotes/origin/{self.branch}")
 
     def _repo_contents(self, ref: str) -> list[str]:
         res = self.git.run("ls-tree", "-r", "--name-only", "-z", ref, check=False)
@@ -821,32 +862,95 @@ class Channel:
             return f"gitwire: 참가자 상태 {m}건"
         return f"gitwire: {n or 1} record(s)"
 
+    def _absorb_plan(self) -> _Absorb:
+        """이번에 한 커밋으로 흡수할 것을 **확정한다.** ⚠️ `_lock` 을 쥔 채 부른다.
+
+        무엇을 확정하나 — 스테이징할 경로, 커밋 메시지, 그리고 **걷어낼 대기
+        항목**이다. 마지막 것이 요점이다: 커밋을 락 밖에서 하므로(`flush()`) 그
+        사이에 `write_state()` 가 새 상태를 대기에 넣을 수 있는데, 끝나고
+        `_pending_state` 를 통째로 비우면 **그 건이 조용히 사라진다** (파일은
+        커밋에 실렸는지 알 수 없고 대기에서는 지워졌다). 그래서 "지금 흡수하는
+        것"만 적어 두고 그것만 걷어낸다.
+        """
+        return _Absorb(
+            specs=tuple(self._commit_specs()),
+            message=self._commit_message(),
+            records=tuple(self._pending),
+            states=frozenset(self._pending_state),
+        )
+
+    def _commit_plan(self, plan: _Absorb) -> bool:
+        """계획대로 스테이징하고 커밋한다. 커밋이 **생겼으면** True.
+
+        ⭐ **채널 락을 쥐지 않고 부를 수 있다** (`flush()` 가 그렇게 쓴다 — ④).
+        건드리는 것은 인덱스와 브랜치 ref 뿐이고, 둘 다 `_remote` 가 직렬화한다.
+
+        ⭐ 실측 근거로 `diff --cached --quiet` 한 번(93ms)을 없앤다 — 단,
+        **찍은 레코드가 있을 때만** 이다. 그때는 방금 새 파일을 썼으므로
+        스테이징될 것이 반드시 있고, `git commit` 이 스스로 그 판정을 한다.
+        레코드 없이(참가자 상태만·또는 아무것도 없이) 불릴 때는 인덱스가 정말
+        비어 있을 수 있고 — 값이 바이트 단위로 같으면 그렇다 — 그 경우의
+        "nothing to commit" 은 `git` 의 **번역되는 문구**라 판정에 쓸 수 없다.
+        그래서 그때는 예전처럼 `diff` 로 먼저 묻는다 (호출 수도 예전과 같다).
+
+        ⚠️ 레코드가 있는데 커밋이 실패하면 **소리 내어 실패한다.** 삼켜 버리면
+        push 는 성공하고 레코드는 안 나간 채 "나갔다"로 표시된다 — 이 프로젝트가
+        가장 싫어하는 결과다 (`.gitignore` 에 `records/` 가 들어간 경우가 실제로
+        여기 걸린다).
+        """
+        g = self.git
+        g.run("add", "-A", "--", *plan.specs, check=False)
+        if plan.records:
+            g.run("commit", "-m", plan.message)
+            return True
+        if g.run("diff", "--cached", "--quiet", check=False).returncode != 0:
+            g.run("commit", "-m", plan.message)
+            return True
+        return False
+
+    def _absorb_done(self, plan: _Absorb) -> None:
+        """흡수한 것만 대기에서 걷어낸다. ⚠️ `_lock` 을 쥔 채 부른다."""
+        absorbed = set(plan.records)
+        self._pending[:] = [p for p in self._pending if p not in absorbed]
+        self._pending_state -= plan.states
+
     def _absorb_worktree(self) -> None:
         """작업 사본의 미커밋 변경(레코드·참가자 상태)을 커밋한다.
 
         두 자리에서 부른다:
 
-        * `flush()` — 방금 찍은 레코드를 커밋한다 (push 직전).
+        * `flush()` — 방금 찍은 레코드를 커밋한다 (push 직전). 그쪽은 커밋을
+          **락 밖에서** 하려고 위 세 조각을 직접 쓴다.
         * `_integrate()` — 아래 통합 로직은 `reset --hard` 를 쓸 수 있는데 그건
           **미커밋 파일을 지운다.** 파괴적 동작 전에 흡수해서 잃지 않는다. 여기서
           걸리는 것은 보통 **참가자 상태**뿐이다 — 레코드는 `flush()` 안의
-          찍기~커밋 구간(락 안)에서만 작업 사본에 존재한다.
+          찍기~커밋 구간에서만 작업 사본에 존재한다.
         """
-        g = self.git
-        g.run("add", "-A", "--", *self._commit_specs(), check=False)
-        if g.run("diff", "--cached", "--quiet", check=False).returncode != 0:
-            g.run("commit", "-m", self._commit_message())
-        self._pending.clear()
-        self._pending_state.clear()
+        plan = self._absorb_plan()
+        self._commit_plan(plan)
+        self._absorb_done(plan)
 
     def _mark_pushed(self, sha: str | None = None) -> None:
-        """여기까지가 원격에 반영됐음을 로컬 ref 로 남긴다 (기본 현재 HEAD)."""
+        """여기까지가 원격에 반영됐음을 로컬 ref 로 남긴다 (기본 현재 HEAD).
+
+        ⭐ loose ref 파일을 **직접 쓴다** — `git update-ref` 한 번이 실측 91ms 고
+        하는 일은 41바이트 파일 하나를 쓰는 것이다 (`localrefs.write_ref` 가 git
+        과 같은 락 규약을 쓴다). 못 쓰면 예전처럼 `update-ref` 로 되돌아간다.
+
+        ⚠️ ref 캐시를 무효화하지 않는다. 이 ref 는 캐시의 스탬프에도, 캐시가 든
+        키(`HEAD`·`refs/remotes/origin/*`)에도 들어 있지 않다 — 무효화할 것이
+        없다. (예전에는 `update-ref` 가 읽기 전용이 아니라서 `GuardedRunner` 가
+        **덤으로** 캐시를 버렸다. 그 부수효과가 없어지는 것이 이득이다.)
+        """
+        target = sha or self._head()
+        if target and _localrefs.write_ref(self.clone_dir, PUSHED_REF, target):
+            return
         self.git.run("update-ref", PUSHED_REF, sha or "HEAD", check=False)
 
     def _unpushed_count(self) -> int:
         """아직 원격에 올리지 않은 커밋 수. shallow 에서도 성립한다."""
         g = self.git
-        if g.ok("rev-parse", "--verify", "--quiet", PUSHED_REF):
+        if self._ref_sha(PUSHED_REF) is not None:
             res = g.run("rev-list", "--count", f"{PUSHED_REF}..HEAD", check=False)
             if res.returncode == 0:
                 return int(res.stdout.strip() or "0")
@@ -890,7 +994,7 @@ class Channel:
             self._mark_pushed()
             return
         # 미푸시 커밋이 있다. 그것만 원격 위로 옮겨 심는다.
-        if g.ok("rev-parse", "--verify", "--quiet", PUSHED_REF):
+        if self._ref_sha(PUSHED_REF) is not None:
             if g.run(
                 "rebase", *_REBASE_RESOLVE, "--onto", remote, PUSHED_REF, "HEAD",
                 check=False,
@@ -1364,9 +1468,23 @@ class Channel:
         (같은 실수를 `sync()` 에서 한 번 고쳤는데 `flush()` 만 그 규율 밖에
         남아 있었다.)
 
-        지금은 찍기·커밋까지만 `_lock` 안에서 하고, push 는 `_remote` 만 쥔 채
+        지금은 찍기까지만 `_lock` 안에서 하고, push 는 `_remote` 만 쥔 채
         **락 밖**에서 기다린다. 같은 조건에서 전송 응답 중앙값이 3365ms → 49ms 가
         되고, push 중 조회는 3484ms → 46ms 가 된다 (README 「push 도 락 밖으로」).
+
+        ⭐ **커밋(로컬 git)도 채널 락 밖에서 한다.**
+
+        `add`+`commit` 은 이 머신에서 실측 ~290ms 다. 그것이 `_lock` 안에 있는
+        동안에는 그 방의 다음 `append()` 와 모든 읽기가 막힌다 — push 를 빼낸
+        뒤에도 첫 전송이 435~600ms 씩 걸린 이유가 이것이었다. 커밋이 만지는 것은
+        **인덱스와 브랜치 ref** 뿐이고 그 둘은 `_remote` 가 이미 직렬화한다.
+        채널 락이 지키는 것(메모리 대기열·커서·캐시·작업 사본 쓰기)과 겹치지
+        않으므로 락 밖으로 빼도 규율이 깨지지 않는다.
+
+        ⚠️ 대신 **대기 항목을 통째로 비우지 않는다.** 커밋이 도는 사이에
+        `write_state()` 가 새 상태를 대기에 넣을 수 있으므로, 락 안에서 확정한
+        `_Absorb` 에 적힌 것만 걷어낸다 (`_absorb_plan` 도크). 그 사이에 들어온
+        건은 대기에 남아 다음 회차에 나간다 — 하나도 버리지 않는다.
 
         push 중에 들어오는 `append()` 는 **메모리 대기열에만** 붙으므로 작업
         사본·인덱스·HEAD 를 한 바이트도 건드리지 않는다. 그 건들은 다음 flush 가
@@ -1385,10 +1503,22 @@ class Channel:
                     base = self._head()
                     staged = set(self._pending_state)
                     made = self._materialize(batch)   # ⭐ 시각·id·파일
-                    self._absorb_worktree()           # 커밋 — 로컬 변경
+                    plan = self._absorb_plan()        # 흡수할 것을 확정
+                try:
+                    self._commit_plan(plan)           # 커밋 — 채널 락 밖 (④)
+                except BaseException:
+                    # ⚠️ 커밋이 깨졌다. 찍은 것을 **되돌린다** — 그러지 않으면
+                    # 찍힌 파일이 작업 사본에 남고, 대기열은 그대로이므로 재시도가
+                    # 같은 건을 새 id 로 또 찍어 파일이 쌓인다. 되돌리면 다음
+                    # 시도가 그때의 시각으로 다시 찍는다 (`_rewind`).
+                    with self._lock:
+                        self._rewind(base, made, staged)
+                    raise
+                with self._lock:
+                    self._absorb_done(plan)
                     if not made and self._unpushed_count() == 0:
                         return []
-                    head = self._head()
+                    head = self._head_after_commit(base, bool(plan.records))
                 if head is None:
                     with self._lock:
                         self._rewind(base, made, staged)
@@ -1426,6 +1556,30 @@ class Channel:
                     self._settle(batch, made)
                 return list(made)
             return []
+
+    def _head_after_commit(self, base: str | None, committed: bool) -> str | None:
+        """커밋 직후의 HEAD — **한 번 검산한다.** ⚠️ `_lock` 을 쥔 채 부른다.
+
+        ⭐ 이 검산이 `_ref_sha` 의 안전망이다. 커밋이 실제로 생겼다면 HEAD 는
+        `base` 와 **반드시 다르다.** 같게 보인다면 우리가 읽은 ref 파일이 아직
+        낡았다는 뜻이므로 캐시를 버리고 git 에게 직접 묻는다.
+
+        왜 이 한 줄이 필요한가 — 낡은 sha 를 그대로 믿으면 `flush()` 는 *예전
+        커밋을 push 하고* 방금 찍은 레코드를 **나갔다고 표시**한다. 조용한 유실,
+        이 프로젝트가 가장 싫어하는 실패 모드다. 틀릴 확률이 낮다는 것은 안 틀린다
+        는 뜻이 아니므로 값이 싼 검산을 붙여 둔다 (같지 않으면 프로세스 0개다).
+        """
+        head = self._head()
+        if not committed or head != base:
+            return head
+        self._localrefs.invalidate("커밋 직후 HEAD 가 그대로다")
+        res = self.git.run("rev-parse", "--verify", "--quiet", "HEAD", check=False)
+        fresh = res.stdout.strip() or None
+        log.warning(
+            "gitwire: 커밋 직후에도 ref 파일이 예전 sha 였다 — git 에게 다시 물었다 "
+            "(%s → %s)", (base or "없음")[:12], (fresh or "없음")[:12],
+        )
+        return fresh
 
     def _push(self, sha: str | None = None) -> None:
         """`sha`(기본 HEAD)를 원격 브랜치로 밀어낸다.

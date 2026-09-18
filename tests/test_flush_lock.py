@@ -18,6 +18,8 @@ import pytest
 
 import gitwire
 from gitwire.clock import FixedOffsetClock
+from gitwire import localrefs
+from gitwire.errors import GitError
 from gitwire.gitcmd import SubprocessGitRunner
 
 SLOW = 1.0
@@ -402,3 +404,154 @@ def test_close_flushes_without_deadlock(participant, bare_repo, homes):
     recs = [a.append({"n": i}) for i in range(3)]
     a.close()
     assert sorted(landed(bare_repo, homes)) == sorted(r.id for r in recs)
+
+
+# ------------------------------------ 전송 한 번의 git 프로세스 수 · 흡수 무손실
+
+
+class CountingRunner(SubprocessGitRunner):
+    """git 호출을 하위명령으로 적는다 (`BASE_CONFIG` 의 `-c` 쌍은 건너뛴다)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[str] = []
+
+    def run(self, args, **kwargs):
+        self.calls.append(localrefs.subcommand(args) or "?")
+        return super().run(args, **kwargs)
+
+    def reset(self) -> None:
+        self.calls.clear()
+
+
+def test_a_transfer_spawns_exactly_three_git(participant):
+    """⭐ 전송 한 번 = `add` + `commit` + `push`. 그게 전부다.
+
+    예전에는 **7개**였다 — `rev-parse` 2회(기준 HEAD·커밋 후 HEAD)와
+    `diff --cached`, `update-ref` 가 더 있었다. git subprocess 한 번은 하는 일과
+    무관하게 이 머신에서 90~250ms 이므로(비용은 작업이 아니라 프로세스 기동이다 —
+    `localrefs` 모듈 도크) 그 4개가 전송당 **518ms** 였다.
+
+    무엇이 그 4개를 대신하나:
+      * `rev-parse` → `localrefs.ref_sha` 가 `.git` ref 파일을 직접 읽는다.
+      * `update-ref` → `localrefs.write_ref` 가 loose ref 를 직접 쓴다.
+      * `diff --cached` → 찍은 레코드가 있으면 스테이징될 것이 반드시 있으니
+        `git commit` 이 스스로 판정한다 (`_commit_plan`).
+    """
+    runner = CountingRunner()
+    a = participant("a", runner=runner, autopublish=False, auto_archive=False)
+    for i in range(2):                      # 레이아웃·캐시를 데운다
+        a.append({"n": f"warm{i}"})
+        a.flush()
+    runner.reset()
+    rec = a.append({"n": 1})
+    a.flush()
+    assert rec.pushed, "안 나갔다"
+    assert runner.calls == ["add", "commit", "push"], runner.calls
+
+
+class GateOnArmedCommit(SubprocessGitRunner):
+    """`arm()` 한 뒤의 **첫 커밋**을 붙잡아 둔다 (방 초기화 커밋은 통과시킨다)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.armed = False
+        self.held = False
+        self.gate = threading.Event()
+        self.go = threading.Event()
+
+    def arm(self) -> None:
+        self.armed = True
+
+    def run(self, args, **kw):
+        if self.armed and not self.held and any(a == "commit" for a in args):
+            self.held = True
+            self.gate.set()
+            self.go.wait(60)
+        return super().run(args, **kw)
+
+
+def test_state_written_during_the_unlocked_commit_still_gets_published(
+    participant, bare_repo, homes
+):
+    """⚠️ 커밋을 락 밖에서 하는 대가 — 그 창에 들어온 건을 **아무도 안 밀면** 안 된다.
+
+    `flush()` 는 `add`+`commit` 을 채널 락 **밖에서** 한다(그래야 그 ~290ms 동안
+    `append()`·읽기가 막히지 않는다 — 위 `[flush]` 측정). 그 창에서
+    `write_state()` 가 들어오면 이런 일이 벌어진다:
+
+    1. `write_state` 는 파일을 쓰고 `_pending_state` 에 넣는다.
+    2. 그리고 `_drain()` 을 부르는데, **이미 누가 밀고 있으므로**(`_publishers>0`)
+       "그 쪽이 내 것까지 가져간다"고 믿고 그냥 돌아간다 (`_drain` 규칙 2).
+    3. 그런데 도는 쪽이 끝나면서 `_pending_state` 를 **통째로 비우면** 그 건은
+       아무의 몫도 아니게 된다 — 드레인 루프는 "대기 없음"으로 보고 빠져나가고,
+       파일은 커밋되지 않은 채 남는다. **아무도 다시 밀지 않는다.**
+
+    그래서 락 안에서 확정한 `_Absorb` 에 적힌 것만 걷어낸다 (`_absorb_plan`).
+    이 테스트는 그 성질을 *결과*로 못 박는다: 커밋 한복판에 상태를 하나 넣고,
+    **추가로 아무것도 부르지 않은 채** 그것이 커밋되고 원격까지 가는지 본다.
+    """
+    runner = GateOnArmedCommit()
+    a = participant("a", runner=runner, auto_archive=False)   # autopublish 기본
+    runner.arm()
+    sending = threading.Thread(target=lambda: a.append({"n": 0}), daemon=True)
+    sending.start()
+    assert runner.gate.wait(30), "커밋이 시작되지 않았다"
+    # ⭐ 커밋이 도는 **그 순간** 새 상태가 들어온다 (락이 비어 있어야 가능하다).
+    rel = a.write_state("late@localhost", {"cursor": "c2"})
+    runner.go.set()
+    sending.join(90)
+    assert not sending.is_alive(), "발행이 끝나지 않았다"
+
+    # 여기서부터 우리는 **아무것도 더 부르지 않는다.** 드레인 루프가 그 건을
+    # 가져갔어야 한다.
+    assert a.info()["pending_state"] == 0, "대기에 남았다"
+    committed = a.git.out("ls-tree", "-r", "--name-only", "HEAD").splitlines()
+    assert rel in committed, f"커밋되지 않았다 (아무도 밀지 않았다): {committed}"
+    assert a._unpushed_count() == 0, "커밋은 됐는데 push 되지 않았다"
+
+    verify = gitwire.Channel(
+        str(bare_repo), home=homes("verify"), sender="verify",
+        clock=FixedOffsetClock(0.0), autopublish=False,
+    ).open()
+    try:
+        states = verify.read_states(fresh=True)
+        assert "late@localhost" in states, f"원격에 없다: {sorted(states)}"
+        assert states["late@localhost"].value == {"cursor": "c2"}
+    finally:
+        verify.close()
+
+
+def test_a_commit_that_stages_nothing_fails_loudly_and_rewinds(
+    participant, bare_repo, homes
+):
+    """⚠️ 레코드를 찍었는데 커밋에 아무것도 안 실리면 **소리 내어 실패한다.**
+
+    예전에는 `diff --cached --quiet` 로 먼저 묻고 "변경 없음"이면 커밋을 건너뛰었다.
+    그 분기가 이 경우를 **조용히 삼켰다**: 커밋이 없으니 HEAD 는 그대로, push 는
+    "Everything up-to-date" 로 성공, 그리고 대기열은 *나갔다*고 표시된다 —
+    레코드는 작업 사본에 남아 아무도 다시 보지 않는다.
+
+    실제로 여기 걸리는 설정이 있다: 누군가 이 클론의 `.gitignore` 에 `records/`
+    를 넣으면 `git add` 가 아무것도 스테이징하지 못한다.
+
+    지금은 찍은 레코드가 있으면 `git commit` 을 그대로 부르고, 실패를 올린다.
+    그리고 찍은 것을 **되돌린다** — 파일도 지우고 건은 대기열에 남긴다.
+    """
+    a = participant("a", autopublish=False, auto_archive=False)
+    ignore = a.clone_dir / ".gitignore"
+    ignore.write_text(
+        ignore.read_text(encoding="utf-8") + "records/\n", encoding="utf-8"
+    )
+    a.git.run("add", "--", ".gitignore")
+    a.git.run("commit", "-m", "테스트: records/ 를 무시하게 만든다")
+
+    ticket = a.append({"n": 0})
+    with pytest.raises(GitError):
+        a.flush()
+
+    # 되돌렸다 — 찍힌 파일이 남지 않았고, 건은 여전히 대기열에 있다.
+    assert list((a.clone_dir / "records").rglob("*.json")) == []
+    assert ticket.pushed is False and ticket.dropped is False
+    assert a.info()["pending"] == 1, "대기열에서 사라졌다"
+    assert landed(bare_repo, homes) == [], "안 나갔는데 원격에 있다"

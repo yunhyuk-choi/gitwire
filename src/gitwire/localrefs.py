@@ -59,9 +59,14 @@ HEAD 를 읽을 수 없으면 스탬프를 만들지 않고 **매번 git 에게 
 
 from __future__ import annotations
 
+import logging
+import os
+import re
 import threading
 from pathlib import Path
 from typing import Callable, Sequence
+
+log = logging.getLogger("gitwire")
 
 #: 스탬프에 내용까지 담는 파일의 크기 상한. ref 파일은 41바이트(sha + 개행)이고
 #: symref 는 그보다 조금 길다. 이보다 크면 stat 만 본다.
@@ -74,6 +79,7 @@ READ_ONLY_COMMANDS = frozenset({
     "cat-file",
     "commit-tree",
     "count-objects",
+    "credential",
     "diff",
     "for-each-ref",
     "hash-object",
@@ -115,6 +121,134 @@ def is_read_only(args: Sequence[str]) -> bool:
     return subcommand(args) in READ_ONLY_COMMANDS
 
 
+#: ref 파일 하나에 담긴 값. sha1(40) 또는 sha256(64) 16진수.
+_SHA_RE = re.compile(r"\A[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
+
+#: symref 사슬을 따라갈 최대 깊이. 실전에서는 1(`HEAD` → `refs/heads/x`)이다.
+_MAX_SYMREF = 4
+
+
+def gitdir(clone_dir: Path) -> Path | None:
+    """ref 파일을 **직접 읽어도 되는** `.git` 인가. 아니면 None (= git 에게 물어라).
+
+    거르는 것은 모듈 도크의 「신뢰할 수 없으면 캐시하지 않는다」와 같은 판정이다:
+    `.git` 이 파일이면 워크트리·서브모듈이라 ref 가 다른 곳에 있고, `reftable`
+    백엔드는 ref 를 `refs/*` 파일로 두지 않는다.
+    """
+    gd = Path(clone_dir) / ".git"
+    if not gd.is_dir():
+        return None
+    if (gd / "reftable").exists():
+        return None
+    return gd
+
+
+def _packed(gd: Path, name: str) -> tuple[bool, str | None]:
+    """`packed-refs` 에서 `name` 을 찾는다. 반환 규약은 `ref_sha` 와 같다."""
+    try:
+        raw = (gd / "packed-refs").read_bytes()
+    except FileNotFoundError:
+        return (True, None)                     # 파일이 없다 = 묶인 ref 도 없다
+    except OSError:
+        return (False, None)                    # 읽을 수 없다 — 모른다
+    want = name.encode()
+    for line in raw.splitlines():
+        if not line or line[:1] in (b"#", b"^"):
+            continue                            # 헤더 / peel 줄
+        sha, _, ref = line.partition(b" ")
+        if ref.strip() == want:
+            text = sha.decode("ascii", "replace")
+            return (True, text) if _SHA_RE.match(text) else (False, None)
+    return (True, None)
+
+
+def ref_sha(clone_dir: Path, name: str = "HEAD") -> tuple[bool, str | None]:
+    """ref 의 sha 를 **`.git` 파일에서 직접** 읽는다 — git 프로세스 0개.
+
+    반환은 `(판정했나, sha)` 다. 이 두 값을 갈라 주는 것이 요점이다:
+
+    * `(True, "<sha>")` — 그 ref 는 이 sha 다.
+    * `(True, None)`    — 그 ref 는 **없다** (unborn 브랜치).
+    * `(False, None)`   — **모른다.** 호출자는 `rev-parse` 로 물어야 한다.
+
+    셋을 합치면 "모른다"가 "없다"로 번역되고, 그 오역이 정확히 *우리가 가장
+    싫어하는 조용한 오류*다 (없다고 보면 `_integrate` 가 `reset --hard` 로 간다).
+
+    왜 이것이 필요한가 — `rev-parse` 한 번이 이 머신에서 **87ms**(프로세스 기동
+    비용이고 하는 일과 무관하다, `localrefs` 모듈 도크)인데 전송 한 번에 두 번
+    돈다. 이 함수는 stat + 41바이트 읽기 몇 번이라 **0.1ms 미만**이다.
+
+    ⚠️ `rev-parse --verify` 와 **한 가지가 다르다** — 오브젝트가 실제로 있는지
+    확인하지 않는다(그건 `.git/objects` 를 뒤지는 일이다). ref 가 없는 오브젝트를
+    가리키는 손상된 클론에서는 `rev-parse` 가 "없다"로, 이 함수는 "이 sha 다"로
+    답한다. 그 차이로 무엇도 조용히 사라지지 않는다: 그 sha 를 쓰는 다음 명령이
+    큰 소리로 실패한다 (push·merge-base 전부 오브젝트를 읽는다).
+    """
+    gd = gitdir(clone_dir)
+    if gd is None:
+        return (False, None)
+    for _ in range(_MAX_SYMREF):
+        if name != "HEAD" and not (name.startswith("refs/") and ".." not in name):
+            return (False, None)                # 모양을 모른다 — 판단 보류
+        try:
+            raw = (gd / name).read_bytes()
+        except FileNotFoundError:
+            return _packed(gd, name)            # loose 가 없다 → 묶인 쪽
+        except OSError:
+            return (False, None)
+        text = raw.decode("utf-8", "replace").strip()
+        if text.startswith("ref:"):
+            name = text[4:].strip()
+            continue
+        return (True, text) if _SHA_RE.match(text) else (False, None)
+    return (False, None)                        # symref 사슬이 너무 깊다·순환
+
+
+def write_ref(clone_dir: Path, name: str, sha: str) -> bool:
+    """loose ref 파일을 **git 의 락 규약대로** 직접 쓴다. 성공했으면 True.
+
+    False 면 호출자는 `git update-ref` 로 되돌아가야 한다 (실패가 아니라 폴백).
+
+    왜 — `update-ref` 한 번도 프로세스 기동 **91ms** 다. 이 함수는 파일 두 번
+    쓰기다. 규약은 git 과 같다: `<ref>.lock` 을 **배타 생성**해 쓰고 제자리로
+    rename 한다. 그래서 같은 순간 `git update-ref` 가 돌면 둘 중 하나만 이기고,
+    반쯤 쓰인 ref 파일이 보이는 일이 없다.
+
+    ⚠️ **reflog 를 쓰지 않는다.** `core.logAllRefUpdates` 의 기본값은
+    `refs/heads`·`refs/remotes`·`refs/notes`·`HEAD` 에만 로그를 남기므로 우리가
+    쓰는 `refs/gitwire/*` 에는 원래 reflog 가 생기지 않는다 — 기본 설정에서는
+    `update-ref` 와 결과가 **한 바이트도 다르지 않다.** `always` 로 켜 둔 사람은
+    이 ref 의 reflog 만 잃고, 그 reflog 는 아무도 읽지 않는다.
+    """
+    gd = gitdir(clone_dir)
+    if gd is None or not (name.startswith("refs/") and ".." not in name):
+        return False
+    if not _SHA_RE.match(sha):
+        return False
+    target = gd / name
+    lock = gd / (name + ".lock")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    except OSError:
+        # ⚠️ 락을 못 얻었다 (남이 쥐고 있거나 쓸 수 없는 곳이다). **그 파일에
+        # 손대지 않는다** — 남의 락을 치우면 그쪽 ref 갱신이 깨진다.
+        return False
+    try:
+        try:
+            os.write(fd, (sha + '\n').encode("ascii"))
+        finally:
+            os.close(fd)
+        os.replace(str(lock), str(target))
+        return True
+    except OSError:
+        try:
+            lock.unlink()            # 우리가 만든 락만 치운다
+        except OSError:
+            pass
+        return False
+
+
 def _part(path: Path) -> tuple:
     """파일 하나의 스탬프 조각 — (크기, mtime_ns, ctime_ns, 내용|None)."""
     try:
@@ -154,13 +288,12 @@ class LocalRefCache:
     # --------------------------------------------------------------- 스탬프
 
     def _gitdir(self) -> Path | None:
-        """`.git` 디렉토리. 신뢰할 수 없는 모양이면 None (= 캐시 끔)."""
-        gitdir = self.clone_dir / ".git"
-        if not gitdir.is_dir():
-            return None                         # `.git` 파일 = 워크트리/서브모듈
-        if (gitdir / "reftable").exists():
-            return None                         # reftable 백엔드 — 파일 스탬프 불가
-        return gitdir
+        """`.git` 디렉토리. 신뢰할 수 없는 모양이면 None (= 캐시 끔).
+
+        판정은 모듈 함수 `gitdir()` 하나다 — 직접 읽기(`ref_sha`)와 **같은 기준**
+        이어야 한다. 둘이 갈리면 한쪽만 신뢰하는 모양이 생긴다.
+        """
+        return gitdir(self.clone_dir)
 
     def stamp(self) -> tuple | None:
         """지금의 ref 파일 상태. None 이면 **캐시하지 않는다**."""
