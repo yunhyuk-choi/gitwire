@@ -41,10 +41,23 @@ log = logging.getLogger("gitwire")
 
 DEFAULT_BRANCH = "main"
 DEFAULT_POLL_INTERVAL = 30.0
-DEFAULT_BATCH_WINDOW = 3.0
+
+#: **한 커밋의 상한**이다 (발행 트리거가 아니다 — 트리거는 "대기열이 비지
+#: 않았다" 하나뿐이다. `_drain()`).
+#:
+#: 왜 상한을 남기나 — 한 커밋에 수천 건을 담으면 트리 쓰기·push 가 통째로 커져
+#: 그 한 번의 실패 비용(= `_rewind` 로 되돌릴 양)과 지연이 함께 튄다. 초과분은
+#: **기다리지 않는다**: 드레인 루프가 곧바로 다음 회차로 가져가 또 민다.
 DEFAULT_MAX_BATCH = 200
+
 DEFAULT_PUSH_ATTEMPTS = 5
 DEFAULT_MAX_DELIVERY_ATTEMPTS = 3
+
+#: 발행이 실패해 대기열이 남았을 때 **재시도** 간격(초). ⚠️ 배칭 창이 아니다 —
+#: 정상 경로에는 어떤 대기도 없다(`_drain()`). 이건 "밀 수 없었다"가 된 뒤에만
+#: 도는 그물이고, 성공하면 최소값으로 돌아간다.
+RETRY_DELAY_MIN = 0.5
+RETRY_DELAY_MAX = 30.0
 
 #: 배치 계산 모드
 MODE_DIFF = "diff"   # 기준 커밋..목표 커밋 diff (정상 경로)
@@ -116,6 +129,10 @@ def credential_cache(
     git 이 표준으로 제공하는 `credential-cache` 헬퍼 한 줄이다. 무엇을 사고
     무엇을 파는지는 `Channel._configure_credential_helpers()` 의 주석에 있다 —
     **켜기 전에 읽어라.** 기본값은 끔(옵트인)이다.
+
+    ⚠️ `git-credential-cache` 는 **없는 머신이 있다** (실측: Windows 의 git
+    배포에는 `git-credential-wincred.exe` 만 들어 있다). 그래서 기본 경로는
+    이것이 아니라 OS 기본 저장소 헬퍼다 (`gitcmd.credential_config`).
     """
     return [f"cache --timeout={max(1, int(timeout))}"]
 
@@ -299,7 +316,7 @@ class Channel:
         runner: GitRunner | None = None,
         clock: Any | None = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
-        batch_window: float = DEFAULT_BATCH_WINDOW,
+        autopublish: bool = True,
         max_batch: int = DEFAULT_MAX_BATCH,
         depth: int | None = None,
         name: str | None = None,
@@ -323,7 +340,11 @@ class Channel:
         # 않게 (`where` 처럼 읽기만 하는 경로가 있다).
         self._sender: str | None = records.slug_sender(sender) if sender else None
         self.poll_interval = poll_interval
-        self.batch_window = batch_window
+        # True(기본) = `append()`·`write_state()` 가 **즉시** 발행을 시작한다
+        #   (드레인 루프 — `_drain()`). 창도 타이머도 없다.
+        # False = 대기열에 넣기만 한다. 언제 나갈지는 호출자가 `flush()` /
+        #   `append(flush=True)` / `close()` 로 정한다 (배치 발행·테스트용).
+        self.autopublish = bool(autopublish)
         self.max_batch = max_batch
         self.depth = depth
         self.author_name = author_name
@@ -399,9 +420,13 @@ class Channel:
         # 세는 이유: 레코드는 "사건 N건"이고 이쪽은 "값을 덮어썼다"라 커밋
         # 메시지·건수의 의미가 다르다. 둘 다 같은 커밋으로 나간다.
         self._pending_state: set[str] = set()
-        self._pending_since: float | None = None
+        # ⭐ 지금 발행(찍기→커밋→push)을 돌리고 있는 호출자 수. **0 이면 아무도
+        # 밀고 있지 않다** = 새로 들어온 건을 부르는 쪽이 직접 민다. 이 판정과
+        # 대기열 넣기가 **같은 `_lock` 안**에서 일어나므로 "도는 쪽이 방금 큐를
+        # 비었다고 보고 나가는" 틈으로 건이 사라지지 않는다 (`_drain()` 도크).
+        self._publishers = 0
         self._flush_cv = threading.Condition(self._lock)
-        self._flusher: threading.Thread | None = None
+        self._retrier: threading.Thread | None = None
         self._closing = threading.Event()
         self._opened = False
         self._attempts: dict[str, int] = {}
@@ -451,6 +476,9 @@ class Channel:
             cwd or self.clone_dir,
             env=self.credential.env(self.dir),
             secrets=self.credential.secrets(),
+            # 자격증명 사슬을 이 채널이 직접 짰으면(`credential_helpers=…`)
+            # gitcmd 가 목록을 초기화하지 않게 한다 — 그러면 그 설정이 무효가 된다.
+            cheap_credentials=self.credential_helpers is None,
         )
 
     @property
@@ -514,6 +542,13 @@ class Channel:
 
     def _configure_credential_helpers(self) -> None:
         """이 클론의 **로컬** `credential.helper` 사슬을 다시 짠다 (옵트인).
+
+        ⚠️ 기본 경로는 이것이 **아니다.** 아무것도 주지 않으면 `gitcmd` 가
+        네트워크 호출에만 OS 기본 저장소 헬퍼를 `-c` 로 얹는다
+        (`gitcmd.credential_config` — 설정 파일을 건드리지 않는다). 여기 오는
+        것은 소비자가 사슬을 **직접** 짠 경우뿐이고, 그때는 그 지정이 비켜선다
+        (`_git()` 의 `cheap_credentials`) — 그러지 않으면 우리가 목록을
+        초기화해 이 설정을 무효로 만든다.
 
         왜 이런 게 필요한가 — 실측(Windows 11 · git 2.51 · GitHub private repo,
         같은 머신에서 5회씩)::
@@ -803,7 +838,6 @@ class Channel:
             g.run("commit", "-m", self._commit_message())
         self._pending.clear()
         self._pending_state.clear()
-        self._pending_since = None
 
     def _mark_pushed(self, sha: str | None = None) -> None:
         """여기까지가 원격에 반영됐음을 로컬 ref 로 남긴다 (기본 현재 HEAD)."""
@@ -1012,9 +1046,31 @@ class Channel:
         (gitwire-chat 은 낙관적 항목에 `~pending/` 임시 id 를 주고, push 되어
         실제 id 가 생기는 순간에 갈아끼운다).
 
-        커밋·push 는 배칭 창(`batch_window`) 안의 여러 건을 묶어 한 커밋으로
-        나간다. `flush=True` 면 이 호출 안에서 push 까지 끝내므로 돌아온 티켓이
-        이미 settled 다 (`ticket.id` 를 바로 쓸 수 있다).
+        ⭐ **기다리지 않는다 — 드레인 루프다** (`_drain()`)
+        ------------------------------------------------
+        배칭 창(타이머)이 **없다.** 대기열이 비어 있지 않으면 곧바로 민다. 그
+        push 가 도는 동안 들어온 건들은 쌓이고, push 가 끝나면 쌓인 것이 **한
+        커밋으로** 또 나간다. 그래서 묶음 크기가 부하에 맞춰 저절로 정해진다 —
+        원격이 느리면 크게 묶이고, 빠르면 지연이 그만큼 작아진다. **조율할 숫자가
+        없다.**
+
+        `flush=True` 면 이 호출이 **이 건이 나갈 때까지** 기다린다. 돌아온 티켓은
+        이미 settled 다 (`ticket.id` 를 바로 쓸 수 있다). CLI 처럼 곧 끝나는
+        프로세스가 이것을 쓴다.
+
+        ⚠️ **부르는 쪽이 밀 수도 있다 — 소비자가 알아야 할 두 가지**
+
+        * 대기열이 비어 있었으면 이 호출이 그 push 를 **직접** 기다린다(그게
+          "곧바로 민다"의 구현이다). 이미 누가 밀고 있으면 기다리지 않는다.
+          즉 최악의 대기 = push 한 번이고, 예전의 배칭 창처럼 *아무도 아무것도
+          안 하는* 대기는 없다.
+        * 그 push 가 실패해도 **이 호출은 예외를 올리지 않는다** — 발행(대기열에
+          넣기)은 성공했고 전송만 못 한 것이기 때문이다. 대신 잃지 않는다:
+          건은 대기열에 남고(`_rewind`), 경고 로그가 남고, `info()["pending"]`
+          에 드러나고, 배경 재시도가 계속 민다(`_retry_loop`). 나갔는지 확인해야
+          하면 `ticket.wait(초)` 로 묻거나 `flush=True`(= 기다리겠다는 계약,
+          실패하면 예외)를 쓴다. `autopublish=False` 면 이 호출은 절대
+          네트워크를 타지 않는다.
         """
         with self._lock:
             self.open()
@@ -1022,16 +1078,7 @@ class Channel:
             self._seq += 1
             ticket = PendingRecord(self._seq, payload, who)
             self._queue.append(ticket)
-            if self._pending_since is None:
-                self._pending_since = time.monotonic()
-            need_now = (
-                flush or self.batch_window <= 0 or len(self._queue) >= self.max_batch
-            )
-            if not need_now:
-                self._ensure_flusher()
-                self._flush_cv.notify_all()
-        if need_now:
-            self.flush()
+        self._drain(wait_for=ticket if flush else None)
         return ticket
 
     def _stamp(self) -> datetime:
@@ -1109,8 +1156,6 @@ class Channel:
                 pass                     # 다른 레코드가 있다 — 그대로 둔다
         self._pending.clear()
         self._pending_state.update(staged)
-        if self._has_pending() and self._pending_since is None:
-            self._pending_since = time.monotonic()
 
     def _settle(
         self, batch: list[PendingRecord], made: list[records.Record]
@@ -1125,36 +1170,170 @@ class Channel:
             item._settle(rec)
         del self._queue[: len(batch)]
 
-    def _ensure_flusher(self) -> None:
-        if self._flusher and self._flusher.is_alive():
-            return
-        self._closing.clear()
-        self._flusher = threading.Thread(
-            target=self._flush_loop, name="gitwire-flush", daemon=True
-        )
-        self._flusher.start()
-
     def _has_pending(self) -> bool:
         """아직 밀어내지 못한 것이 있나 (대기열의 레코드 **또는** 참가자 상태)."""
         return bool(self._queue or self._pending_state)
 
-    def _flush_loop(self) -> None:
+    def _drain(self, *, wait_for: PendingRecord | None = None) -> None:
+        """대기열을 **지금** 밀어낸다 — 비워질 때까지. 타이머가 없다.
+
+        ⭐ 규칙이 셋이다:
+
+        1. **아무도 밀고 있지 않으면 부르는 쪽이 민다.** 창도 예약도 없다 —
+           "먼저 할 수 있는 것을 해버린다".
+        2. **이미 누가 밀고 있으면 그냥 돌아온다.** 우리 건은 대기열에 있고, 도는
+           쪽이 자기 push 를 마친 뒤 **그것까지 가져간다**.
+        3. 밀던 쪽은 한 push 가 끝나면 그 사이 쌓인 것을 **한 커밋으로** 또 민다.
+           대기열이 비면 멈춘다(그 다음은 `append()` 가 다시 깨운다).
+
+        그래서 묶음 크기가 부하에 맞춰 저절로 정해진다 — **조율할 숫자가 없다.**
+
+        ⚠️ **조용히 사라지는 자리가 없어야 한다.** 규칙 2의 판정(`_publishers`)과
+        규칙 3의 "대기열이 비었나" 판정이 **둘 다 `_lock` 안**이고, `append()` 의
+        대기열 넣기도 같은 락 안이다. 그래서 "도는 쪽이 방금 비었다고 보고
+        빠져나가는 동안 새 건이 들어오는" 틈이 존재하지 않는다: 그 건은 락을
+        먼저 잡은 쪽 기준으로 *도는 쪽이 가져가거나*(아직 `_publishers>0`)
+        *넣은 쪽이 직접 민다*(이미 0) — 둘 중 하나로 반드시 간다.
+
+        ⚠️ push 가 실패하면 예외가 **부른 쪽으로 올라간다** (조용히 삼키지
+        않는다). 대기열은 그대로 남고(`_rewind`), 배경 재시도가 이어받는다
+        (`_arm_retry`). `wait_for` 를 준 경우(= `flush=True`)는 그 건이
+        나갈 때까지 계속 민다 — `max_batch` 를 넘긴 위치에 있어도 다음 회차가
+        가져가므로 "기다렸는데 안 나갔다"가 되지 않는다.
+        """
+        if wait_for is None and not self.autopublish:
+            return
+        with self._lock:
+            self.open()
+            if wait_for is None and self._publishers:
+                return                      # 규칙 2 — 도는 쪽이 가져간다
+            self._publishers += 1
+        released = False
+        try:
+            while True:
+                with self._flush_cv:
+                    mine_done = wait_for is not None and (
+                        wait_for.pushed or wait_for.dropped
+                    )
+                    if mine_done or not self._has_pending():
+                        # ⚠️ **내려놓는 것도 같은 락 구간에서** 한다. 이 판정과
+                        # `_publishers` 감소가 갈라지면, 그 틈에 `append()` 한
+                        # 건은 "도는 쪽이 있다"고 보고 돌아가는데 도는 쪽은 이미
+                        # 나가 버려서 아무도 밀지 않는 상태가 된다 (다음 발행까지
+                        # 지연). 한 구간으로 묶으면 그 건은 *우리가 보거나*
+                        # *자기가 미는* 쪽으로 반드시 갈린다.
+                        self._publishers -= 1
+                        released = True
+                        if self._has_pending():
+                            self._arm_retry()   # `wait_for` 만 챙기고 나온 경우
+                        self._flush_cv.notify_all()
+                        return
+                    # 진척 판정용 — 대기열 **맨 앞**이 누구였나. `flush()` 는 앞에서
+                    # 잘라 가므로, 앞이 그대로면 이번 회차는 아무것도 못 민 것이다.
+                    # (길이로 재면 "미는 동안 같은 수가 새로 들어온" 정상 상황을
+                    #  진척 없음으로 오판해 쓸데없이 재시도로 넘긴다.)
+                    was = self._queue[0].seq if self._queue else None
+                    states = len(self._pending_state)
+                try:
+                    self.flush()
+                except Exception as exc:
+                    # ⚠️ **기다리라고 한 쪽에만 예외를 준다.**
+                    #
+                    # `flush=True`·`flush()` 는 "이번 건이 나갈 때까지 기다린다"는
+                    # 계약이므로 실패를 숨기면 거짓말이 된다 → 올린다.
+                    #
+                    # 반면 `append()`(기다리지 않는 쪽)에서 전송 실패를 예외로
+                    # 올리면 **발행 자체가 실패한 것으로 보인다** — 소비자는 그걸
+                    # "보낼 수 없었다"로 사용자에게 말하고, 그 뒤 배경 재시도가
+                    # 조용히 성공해서 "실패했다더니 나갔다"가 된다 (실측: gitwire-chat
+                    # 의 send 는 append 예외를 RoomError 로 바꾼다). 그래서 이쪽은
+                    # 예외를 올리지 않고, 대신 **잃지 않는다**: 대기열에 그대로 남고
+                    # (`_rewind`), 로그를 남기고, `info()["pending"]` 에 드러나고,
+                    # 배경 재시도가 계속 민다(`finally` → `_arm_retry`).
+                    if wait_for is not None:
+                        raise
+                    log.warning(
+                        "gitwire: 발행 실패 — 대기열에 남기고 배경에서 다시 민다 "
+                        "(대기 %d건): %s",
+                        len(self._queue),
+                        exc,
+                        exc_info=True,
+                    )
+                    return
+                with self._lock:
+                    now = self._queue[0].seq if self._queue else None
+                    if now == was and len(self._pending_state) >= states:
+                        # 예외도 없이 아무것도 못 나갔다 — 여기서 계속 돌면 바쁜
+                        # 루프가 된다. 배경 재시도에 넘긴다 (`finally`).
+                        log.warning(
+                            "gitwire: 발행이 진척되지 않았다 — 배경 재시도로 넘긴다 "
+                            "(대기 %d건)",
+                            len(self._queue),
+                        )
+                        return
+        finally:
+            if not released:
+                with self._flush_cv:
+                    self._publishers -= 1
+                    # 남은 것이 있으면(= 못 밀고 빠져나왔다) 배경이 이어받는다 —
+                    # 여기서 끊기면 조용한 유실이다.
+                    if self._has_pending():
+                        self._arm_retry()
+                    self._flush_cv.notify_all()
+
+    def _arm_retry(self) -> None:
+        """배경 재시도 스레드를 세운다 (`_lock` 을 쥔 채 부른다).
+
+        ⚠️ **정상 경로에는 이 스레드가 아예 없다** — 발행은 부르는 쪽이 그 자리에서
+        한다(`_drain`). 여기 오는 것은 "밀 수 없었다"(오프라인·거부 한도 초과) 뒤
+        또는 `autopublish=False` 에서 `flush=True` 한 건만 챙기고 나온 뒤다.
+        """
+        if not self.autopublish or self._closing.is_set():
+            return
+        if self._retrier and self._retrier.is_alive():
+            return
+        self._retrier = threading.Thread(
+            target=self._retry_loop, name="gitwire-retry", daemon=True
+        )
+        self._retrier.start()
+
+    def _retry_loop(self) -> None:
+        """못 나간 대기분을 배경에서 계속 밀어 본다.
+
+        ⚠️ 배칭 창이 아니다. 대기열이 비면 **타임아웃 없이** 신호를 기다리고,
+        남아 있을 때만 백오프만큼 잤다가 다시 민다. 즉 이 스레드가 만드는 지연은
+        *실패한 뒤의 재시도 간격*뿐이고, 정상 발행은 이 스레드를 거치지 않는다.
+        """
+        delay = RETRY_DELAY_MIN
         while not self._closing.is_set():
             with self._flush_cv:
                 if not self._has_pending():
-                    self._flush_cv.wait(timeout=self.batch_window)
-                    if not self._has_pending():
-                        return
-                since = self._pending_since or time.monotonic()
-                wait = self.batch_window - (time.monotonic() - since)
-                if wait > 0 and len(self._queue) < self.max_batch:
-                    self._flush_cv.wait(timeout=wait)
+                    self._flush_cv.wait()          # ⭐ 타임아웃 없음
                     continue
+                if self._publishers:
+                    self._flush_cv.wait()          # 누가 밀고 있다 — 그쪽이 깨운다
+                    continue
+            if self._closing.wait(delay):
+                return
+            # ⚠️ 진척을 **예외로 판정하지 않는다** — `_drain()` 은 기다리지 않는
+            # 쪽이라 실패를 예외로 올리지 않기 때문이다(`_drain` 도크). 그래서
+            # 남은 양으로 본다: 줄었으면 백오프를 되돌리고, 그대로면 늘린다.
+            # (그러지 않으면 계속 실패하는 원격을 0.5초마다 두드린다.)
+            before = len(self._queue) + len(self._pending_state)
             try:
-                self.flush()
-            except Exception:
-                log.exception("gitwire: 배치 flush 실패")
-                time.sleep(min(self.batch_window, 5.0))
+                self._drain()
+            except Exception:                      # pragma: no cover - 방어
+                log.warning("gitwire: 발행 재시도가 예외로 끝났다", exc_info=True)
+            left = len(self._queue) + len(self._pending_state)
+            if left < before:
+                delay = RETRY_DELAY_MIN
+            else:
+                delay = min(delay * 2, RETRY_DELAY_MAX)
+                log.info(
+                    "gitwire: 아직 밀지 못했다 — %.1f초 뒤 다시 시도한다 (대기 %d건)",
+                    delay,
+                    left,
+                )
 
     def flush(self, push_attempts: int = DEFAULT_PUSH_ATTEMPTS) -> list[records.Record]:
         """대기열을 **한 커밋**으로 묶어 찍고·커밋하고·push 한다. 나간 레코드들.
@@ -1165,6 +1344,11 @@ class Channel:
         실패하면 찍은 것을 **되돌려 대기열로 돌려놓는다**(`_rewind`) — 다음
         시도가 그때의 시각을 다시 찍는다. 그래서 과거 날짜 레코드가 새로 생기는
         경로가 남지 않는다.
+
+        ⭐ **한 회차다** — 대기열 앞에서 `max_batch` 개까지만 가져간다. 비워질
+        때까지 되풀이하는 것은 `_drain()` 의 일이고, `flush()` 를 직접 부르는
+        쪽(`close()`·`autopublish=False` 인 호출자)은 상한을 넘긴 잔여가 남을 수
+        있음을 알아야 한다.
 
         ⭐ **순서를 지킨다.** 대기열 앞에서부터 잘라 한 커밋으로 밀고, 그 push 가
         성공할 때까지 뒤 건을 따로 보내지 않는다(같은 커밋에 실리거나, 실패하면
@@ -1383,8 +1567,14 @@ class Channel:
         ⚠️ `append()` 와 **다르게** 파일을 즉시 디스크에 쓴다. 레코드는 "사건"이라
         시각이 의미를 갖지만(그래서 push 되는 순간에 찍는다 — `append()` 도크)
         이쪽은 "값을 덮어썼다"라서 파일 자체가 곧 현재 값이고, 시각은 부수
-        정보다. 그래서 여기서 바로 쓰고, 커밋·push 는 배칭 창 안에서 다른
-        대기분과 함께 나간다 — 이 호출도 네트워크를 기다리지 않는다.
+        정보다. 그래서 여기서 바로 쓰고, 커밋·push 는 드레인 루프가 다른
+        대기분과 **같은 커밋으로** 가져간다 (`_drain()`).
+
+        ⚠️ `append()` 와 **같은 계약**이다: 아무도 밀고 있지 않으면 이 호출이 그
+        push 를 직접 기다리고, 이미 누가 밀고 있으면 기다리지 않는다(그 쪽이 우리
+        것까지 가져간다). 전송 실패에 예외를 올리지 않고 배경 재시도에 맡긴다 —
+        기다리려면 `flush=True` 를 쓴다. 네트워크를 절대 타지 않아야 하면
+        `autopublish=False` 로 채널을 연다.
         """
         who = _state.state_key(key)
         rel = _state.state_path(who)
@@ -1400,14 +1590,10 @@ class Channel:
             # 캐시는 커밋 sha 로 키가 잡혀 있어 손댈 필요가 없다 (아직 커밋 전이라
             # 어느 커밋의 목록도 바뀌지 않았다).
             self._pending_state.add(rel)
-            if self._pending_since is None:
-                self._pending_since = time.monotonic()
-            need_now = flush or self.batch_window <= 0
-            if not need_now:
-                self._ensure_flusher()
-                self._flush_cv.notify_all()
-        if need_now:
+        if flush:
             self.flush()
+        else:
+            self._drain()
         return rel
 
     # ----------------------------------------------------------------- 읽기
@@ -2108,7 +2294,11 @@ class Channel:
         env = dict(self.credential.env(self.dir))
         env["GIT_INDEX_FILE"] = str(index_path)
         return Git(
-            self._runner, self.clone_dir, env=env, secrets=self.credential.secrets()
+            self._runner,
+            self.clone_dir,
+            env=env,
+            secrets=self.credential.secrets(),
+            cheap_credentials=self.credential_helpers is None,
         )
 
     # ------------------------------------------------------------- 아카이빙
@@ -2646,6 +2836,9 @@ class Channel:
                 # ⚠️ 이제 "대기열에 있는(=아직 시각도 안 찍힌) 레코드 수"다.
                 "pending": len(self._queue),
                 "pending_state": len(self._pending_state),
+                "autopublish": self.autopublish,
+                # 지금 누가 밀고 있나 (드레인 루프 — `_drain()`)
+                "publishing": self._publishers > 0,
                 "auto_archive": self.auto_archive,
                 "archives": len(self._archive_days()),
                 "archive_error": self.archive_last_error,
@@ -2664,8 +2857,13 @@ class Channel:
         with self._flush_cv:
             self._flush_cv.notify_all()
         try:
-            if self._has_pending():
+            # ⚠️ **비워질 때까지** 민다(한 배치가 아니다). `max_batch` 를 넘긴
+            # 대기분이 조용히 버려지는 자리를 남기지 않는다.
+            while self._has_pending():
+                before = len(self._queue) + len(self._pending_state)
                 self.flush()
+                if len(self._queue) + len(self._pending_state) >= before:
+                    break                     # 진척이 없다 — 무한 루프 방지
         except BaseException:
             log.warning("gitwire: 종료 시 밀어내기 실패 — 대기열을 버린다")
             raise
@@ -2674,8 +2872,8 @@ class Channel:
                 for item in self._queue:
                     item._drop()
                 self._queue.clear()
-            if self._flusher and self._flusher.is_alive():
-                self._flusher.join(timeout=5.0)
+            if self._retrier and self._retrier.is_alive():
+                self._retrier.join(timeout=5.0)
             th = self._archive_thread
             if th is not None and th.is_alive():
                 th.join(timeout=10.0)

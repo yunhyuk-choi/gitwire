@@ -67,7 +67,7 @@ class CountingRunner(SubprocessGitRunner):
 
 def _open(bare_repo, home, sender, runner=None):
     kwargs = dict(
-        home=home, sender=sender, clock=FixedOffsetClock(0.0), batch_window=0.0
+        home=home, sender=sender, clock=FixedOffsetClock(0.0)
     )
     if runner is not None:
         kwargs["runner"] = runner
@@ -261,8 +261,7 @@ def test_credential_helpers_are_opt_in_and_local_only(bare_repo, homes):
     )
     on = gitwire.Channel(
         str(bare_repo), home=homes("on"), sender="bob",
-        clock=FixedOffsetClock(0.0), batch_window=0.0,
-        credential_helpers=gitwire.credential_cache(60),
+        clock=FixedOffsetClock(0.0), credential_helpers=gitwire.credential_cache(60),
     ).open()
     try:
         chain = _local_helpers(on.clone_dir)

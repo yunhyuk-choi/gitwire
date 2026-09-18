@@ -68,8 +68,7 @@ class CountingRunner(SubprocessGitRunner):
 
 def _open(bare_repo, home, sender, runner=None, **extra):
     kwargs = dict(
-        home=home, sender=sender, clock=FixedOffsetClock(0.0), batch_window=0.0,
-        auto_archive=False,
+        home=home, sender=sender, clock=FixedOffsetClock(0.0), auto_archive=False,
     )
     kwargs.update(extra)
     if runner is not None:

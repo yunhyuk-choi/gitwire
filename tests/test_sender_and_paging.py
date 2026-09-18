@@ -54,10 +54,8 @@ class FrozenClock:
 
 def test_two_installations_on_one_machine_get_different_senders(bare_repo, homes):
     """⭐ A 의 핵심 — 같은 머신·같은 유저·같은 호스트라도 갈린다."""
-    one = Channel(str(bare_repo), home=homes("one"), clock=FixedOffsetClock(0.0),
-                  batch_window=0.0).open()
-    two = Channel(str(bare_repo), home=homes("two"), clock=FixedOffsetClock(0.0),
-                  batch_window=0.0).open()
+    one = Channel(str(bare_repo), home=homes("one"), clock=FixedOffsetClock(0.0)).open()
+    two = Channel(str(bare_repo), home=homes("two"), clock=FixedOffsetClock(0.0)).open()
     try:
         assert one.sender != two.sender, "두 설치본이 같은 전송 식별자를 갖는다"
 
@@ -78,13 +76,11 @@ def test_two_installations_on_one_machine_get_different_senders(bare_repo, homes
 def test_sender_survives_restart(bare_repo, homes):
     """재시작 = 같은 home 으로 새 객체. 신원은 파일에서 되살아난다."""
     home = homes("restart")
-    first = Channel(str(bare_repo), home=home, clock=FixedOffsetClock(0.0),
-                    batch_window=0.0).open()
+    first = Channel(str(bare_repo), home=home, clock=FixedOffsetClock(0.0)).open()
     original = first.sender
     first.close()
 
-    again = Channel(str(bare_repo), home=home, clock=FixedOffsetClock(0.0),
-                    batch_window=0.0).open()
+    again = Channel(str(bare_repo), home=home, clock=FixedOffsetClock(0.0)).open()
     try:
         assert again.sender == original
         assert (home / "installation.txt").is_file()
@@ -95,7 +91,7 @@ def test_sender_survives_restart(bare_repo, homes):
 def test_explicit_sender_is_respected(bare_repo, homes):
     """하위호환 — 명시적으로 준 sender 는 그대로 쓰고 신원 파일도 만들지 않는다."""
     home = homes("explicit")
-    ch = Channel(str(bare_repo), home=home, sender="alice", batch_window=0.0,
+    ch = Channel(str(bare_repo), home=home, sender="alice",
                  clock=FixedOffsetClock(0.0)).open()
     try:
         rec = ch.append({"n": 1}, flush=True)
@@ -148,7 +144,7 @@ def participant_channel(bare_repo, home, sender="alice"):
     """픽스처를 거치지 않고 채널 하나를 연다 (runner 를 갈아끼울 때 쓴다)."""
     return gitwire.Channel(
         str(bare_repo), home=home, sender=sender,
-        clock=FixedOffsetClock(0.0), batch_window=0.0,
+        clock=FixedOffsetClock(0.0),
     ).open()
 
 
@@ -338,7 +334,7 @@ def test_second_page_costs_no_listing_calls(bare_repo, homes):
     runner = CountingRunner()
     reader = gitwire.Channel(
         str(bare_repo), home=homes("r"), sender="reader",
-        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+        clock=FixedOffsetClock(0.0), runner=runner,
     ).open()
     try:
         first = reader.history_page(limit=3)
@@ -366,7 +362,7 @@ def test_new_day_directory_costs_one_call_then_is_cached(bare_repo, homes):
     runner = CountingRunner()
     reader = gitwire.Channel(
         str(bare_repo), home=homes("r"), sender="reader",
-        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+        clock=FixedOffsetClock(0.0), runner=runner,
     ).open()
     try:
         page = reader.history_page(limit=3)
@@ -392,7 +388,7 @@ def test_cache_cannot_go_stale_when_new_records_arrive(bare_repo, homes):
     runner = CountingRunner()
     reader = gitwire.Channel(
         str(bare_repo), home=homes("r"), sender="reader",
-        clock=FixedOffsetClock(0.0), batch_window=0.0, runner=runner,
+        clock=FixedOffsetClock(0.0), runner=runner,
     ).open()
     try:
         assert [r.payload["i"] for r in reader.history()] == [0, 1, 2, 3, 4, 5]

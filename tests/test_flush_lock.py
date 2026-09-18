@@ -14,6 +14,8 @@ from __future__ import annotations
 import threading
 import time
 
+import pytest
+
 import gitwire
 from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import SubprocessGitRunner
@@ -66,7 +68,7 @@ def landed(bare_repo, homes, name="verify", *, recover=()) -> list[str]:
 def test_push_does_not_block_append_or_reads(participant, capsys):
     """push 가 도는 동안 `append()` 와 읽기가 계속 돌아간다 (시간으로 증명)."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     a.append({"n": "seed"})
 
     pushing = threading.Thread(target=a.flush, daemon=True)
@@ -94,10 +96,61 @@ def test_push_does_not_block_append_or_reads(participant, capsys):
     assert max(reads) < runner.delay * 1000 * 0.5, reads
 
 
+def test_sends_during_a_push_ride_one_commit(participant, bare_repo, homes):
+    """⭐ 창이 없어도 묶인다 — push 가 **도는 동안** 들어온 3건이 한 커밋으로 나간다.
+
+    드레인 루프의 요점이 이 하나다. 대기열이 비어 있으면 부르는 쪽이 그 자리에서
+    밀고(그래서 조용한 방의 한 건은 기다리지 않는다), 미는 동안 들어온 것들은
+    쌓여서 **다음 회차에 한 커밋으로** 나간다. 묶음 크기가 부하에 맞춰 저절로
+    정해지므로 조율할 숫자가 없다.
+
+    ⚠️ "미는 동안"을 만들려면 첫 건을 **다른 스레드**에서 보내야 한다 — 한
+    스레드에서 연달아 보내면 각 건이 자기 push 를 기다렸다 나가고, 그건 묶임이
+    아니라 정상 동작이다(창이 없으니 미룰 이유가 없다).
+    """
+    runner = SlowPushRunner(1.0)
+    a = participant("a", runner=runner)              # autopublish = 기본(켜짐)
+    before = int(a.git.out("rev-list", "--count", "HEAD"))
+    box: dict = {}
+
+    def send_first():
+        box["t"] = a.append({"n": "first"})          # 이 호출이 push 를 돌린다
+
+    runner.started.clear()                           # 방 초기화 push 는 제외
+    th = threading.Thread(target=send_first, daemon=True)
+    th.start()
+    assert runner.started.wait(10), "push 가 시작되지 않았다"
+
+    took = []
+    during = []
+    for i in range(3):
+        t0 = time.perf_counter()
+        during.append(a.append({"n": i}))            # 미는 동안 들어온다
+        took.append((time.perf_counter() - t0) * 1000)
+    th.join(30)
+    assert not th.is_alive()
+    for t in [box["t"], *during]:
+        assert t.wait(30) is not None, "안 나갔다"
+
+    after = int(a.git.out("rev-list", "--count", "HEAD"))
+    assert after - before == 2, (
+        f"커밋 {after - before}개 — 1건 + 3건(한 커밋) = 2 여야 한다"
+    )
+    print(f"\n[drain] push={runner.delay*1000:.0f}ms  "
+          f"미는 동안 append max={max(took):.1f}ms  커밋={after - before}개")
+    # 미는 동안의 발행은 그 push 를 기다리지 않는다
+    assert max(took) < runner.delay * 1000 * 0.8, took
+    # 유실·중복 없음 + id 는 발행 순서대로
+    got = landed(bare_repo, homes)
+    expect = [t.id for t in [box["t"], *during]]
+    assert got == sorted(expect)
+    assert len(got) == len(set(got))
+
+
 def test_flush_still_serializes_pushes(participant):
     """빨라졌다고 push 가 겹치지는 않는다 (`_remote` 가 직렬화한다)."""
     runner = SlowPushRunner(0.4)
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     overlap = []
     live = []
     orig = runner.run
@@ -130,7 +183,7 @@ def test_flush_still_serializes_pushes(participant):
 def test_records_appended_during_push_are_not_lost(participant, bare_repo, homes):
     """push 도중에 들어온 레코드가 전부, 한 번씩, 순서대로 원격에 착지한다."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     first = a.append({"n": "first"})
 
     pushing = threading.Thread(target=a.flush, daemon=True)
@@ -149,6 +202,50 @@ def test_records_appended_during_push_are_not_lost(participant, bare_repo, homes
     assert len(got) == len(set(got))
 
 
+def test_a_failed_publish_keeps_retrying_without_lying(participant, bare_repo, homes, caplog):
+    """밀 수 없었던 건은 **조용히 사라지지도, 실패했다고 거짓말하지도 않는다.**
+
+    네 가지를 함께 못 박는다:
+
+    1. `append()` 는 전송 실패로 **예외를 올리지 않는다.** 발행(대기열에 넣기)은
+       성공했고 전송만 못 한 것이다 — 여기서 예외를 올리면 소비자가 그것을
+       "보낼 수 없었다"로 사용자에게 말하고, 그 뒤 배경 재시도가 성공해서
+       **"실패했다더니 나갔다"** 가 된다 (gitwire-chat 의 send 는 append 예외를
+       RoomError 로 바꾼다).
+    2. 그래도 **조용하지 않다** — 경고 로그가 남고 `info()["pending"]` 에 드러난다.
+    3. 대기열에 남아 **배경이 계속 다시 민다** — 아무도 다음 건을 발행하지 않아도
+       원격이 돌아오는 순간 나간다. 그 재시도 간격이 이 설계에 남은 유일한
+       타이머다(배칭 창이 아니다).
+    4. 반대로 **기다리라고 한 쪽**(`flush()`)에는 실패를 그대로 올린다.
+
+    그리고 그 상태에서 `close()` 가 교착 없이 끝난다.
+    """
+    from test_stamp_on_push import BlockedPushRunner   # noqa: PLC0415
+
+    runner = BlockedPushRunner()
+    a = participant("a", runner=runner)                # autopublish = 기본
+    runner.blocked = True                              # 방이 만들어진 뒤에 막는다
+
+    with caplog.at_level("WARNING", logger="gitwire"):
+        a.append({"n": "지금은 못 나갈 말"})           # 예외 없음
+    assert a.info()["pending"] == 1, "대기열에 남아 있지 않다"
+    assert any("발행 실패" in r.message for r in caplog.records), caplog.text
+
+    # 기다리라고 한 쪽에는 그대로 올린다
+    with pytest.raises(gitwire.GitError):
+        a.flush(push_attempts=1)
+    assert a.info()["pending"] == 1
+
+    runner.blocked = False                             # 원격이 돌아왔다
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline and a.info()["pending"]:
+        time.sleep(0.2)                                # 아무도 append 하지 않는다
+    assert a.info()["pending"] == 0, "배경 재시도가 밀지 않았다"
+    assert len(landed(bare_repo, homes)) == 1
+
+    a.close()                                          # 교착 없이 닫힌다
+
+
 def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, homes):
     """`_mark_pushed` 가 *올린 sha* 를 기록한다 — 안 올린 것을 올렸다고 하지 않는다.
 
@@ -159,7 +256,7 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
     대기열(메모리)에 있다가 `flush()` 안에서만 커밋된다. 그래서 그 경로로 잰다.
     """
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
+    a = participant("a", runner=runner, autopublish=False)
     a.append({"n": 0})
     a.flush()
     pushed = a.git.out("rev-parse", "refs/gitwire/pushed")
@@ -176,8 +273,8 @@ def test_pushed_marker_tracks_what_was_actually_pushed(participant, bare_repo, h
 
 def test_concurrent_participants_do_not_lose_records(participant, bare_repo, homes):
     """두 참가자가 동시에 느린 push 를 해도(선점 → rebase 재시도) 유실이 없다."""
-    a = participant("a", runner=SlowPushRunner(0.3), batch_window=3600.0)
-    b = participant("b", runner=SlowPushRunner(0.3), batch_window=3600.0)
+    a = participant("a", runner=SlowPushRunner(0.3), autopublish=False)
+    b = participant("b", runner=SlowPushRunner(0.3), autopublish=False)
     made = []
     barrier = threading.Barrier(2)
 
@@ -203,8 +300,8 @@ def test_concurrent_participants_do_not_lose_records(participant, bare_repo, hom
 def test_sync_does_not_interleave_with_a_running_push(participant, bare_repo, homes):
     """push 중에 `sync()` 가 끼어들어 방금 올린 커밋을 갈아치우지 않는다."""
     runner = SlowPushRunner()
-    a = participant("a", runner=runner, batch_window=3600.0)
-    b = participant("b", batch_window=0.0)
+    a = participant("a", runner=runner, autopublish=False)
+    b = participant("b")
     mine = [a.append({"n": i}) for i in range(3)]
     theirs = b.append({"n": "b"})          # 원격이 앞서 있다 → a 의 push 는 거부된다
 
@@ -228,7 +325,7 @@ def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes
     """아카이빙·삭제(로컬을 크게 바꾼다)와 발행·flush 가 겹쳐도 유실·중복이 없다."""
     from test_archive import day_of, write_past   # noqa: PLC0415
 
-    a = participant("a", batch_window=3600.0)
+    a = participant("a", autopublish=False)
     old = write_past(a, 2, [{"n": f"old-{i}"} for i in range(6)])
     day = day_of(old[0])
 
@@ -274,9 +371,13 @@ def test_drop_overlapping_with_flush_loses_nothing(participant, bare_repo, homes
     assert {r.id for r in a.history(fresh=True)} == {r.id for r in made}
 
 
-def test_compact_does_not_deadlock_with_a_running_flusher(participant, bare_repo, homes):
-    """`compact()` 는 `_remote` → `_lock` 순서를 지킨다 (교착이 없다)."""
-    a = participant("a", batch_window=0.05)
+def test_compact_does_not_deadlock_with_a_running_publisher(participant, bare_repo, homes):
+    """`compact()` 는 `_remote` → `_lock` 순서를 지킨다 (교착이 없다).
+
+    ⭐ 발행이 **계속 돌고 있는 동안** compact 를 부른다 (드레인 루프는 append
+    마다 곧바로 밀기 때문에, 창을 짧게 잡던 예전 설정이 그대로 기본 동작이다).
+    """
+    a = participant("a")
     recs = [a.append({"n": i}) for i in range(5)]
     a.flush()
     done = {}
@@ -297,7 +398,7 @@ def test_compact_does_not_deadlock_with_a_running_flusher(participant, bare_repo
 
 
 def test_close_flushes_without_deadlock(participant, bare_repo, homes):
-    a = participant("a", runner=SlowPushRunner(0.3), batch_window=3600.0)
+    a = participant("a", runner=SlowPushRunner(0.3), autopublish=False)
     recs = [a.append({"n": i}) for i in range(3)]
     a.close()
     assert sorted(landed(bare_repo, homes)) == sorted(r.id for r in recs)

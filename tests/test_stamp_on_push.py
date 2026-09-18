@@ -96,7 +96,7 @@ def day_of(record_id: str) -> str:
 
 def test_stamp_is_taken_at_push_not_at_append(participant, bare_repo):
     """대기열에 넣고 → 시계를 **다음 날로** → push. 세 값이 전부 push 시점이다."""
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     queued_day = gitwire.records.format_ts(ch.clock.now())[:8]
 
     ticket = ch.append({"n": "오프라인에서 쓴 말"})
@@ -135,7 +135,7 @@ def test_ids_increase_in_send_order_inside_one_batch(participant):
     시계 해상도가 밀리초라 그대로 찍으면 같은 밀리초가 되고, 그러면 순서가 난수
     접미로 갈린다. `_stamp()` 의 단조 증가 가드가 그것을 막는다.
     """
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     tickets = [ch.append({"n": i}) for i in range(5)]
     made = ch.flush()
 
@@ -151,7 +151,7 @@ def test_ids_increase_in_send_order_inside_one_batch(participant):
 
 def test_clock_going_backwards_makes_no_past_record(participant, bare_repo):
     """시계가 거꾸로 가도(보정 재조회) 과거 날짜 레코드가 생기지 않는다."""
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     first = ch.append({"n": 1})
     ch.flush()
     today = day_of(first.id)
@@ -172,7 +172,7 @@ def test_failed_push_leaves_no_record_behind(participant, bare_repo):
     push 경로가 밀어내면 정확히 고치려던 결함이 된다.
     """
     runner = BlockedPushRunner()
-    ch = participant("a", runner=runner, batch_window=3600.0)
+    ch = participant("a", runner=runner, autopublish=False)
     runner.blocked = True                        # 방이 만들어진 뒤에 막는다
     ch.append({"n": "못 나갈 말"})
 
@@ -199,7 +199,7 @@ def test_failed_push_leaves_no_record_behind(participant, bare_repo):
 def test_no_path_creates_a_record_dated_before_today(participant, bare_repo):
     """섞어 돌려도 **오늘보다 과거 날짜** 레코드 디렉토리가 하나도 생기지 않는다."""
     runner = BlockedPushRunner()
-    ch = participant("a", runner=runner, batch_window=3600.0)
+    ch = participant("a", runner=runner, autopublish=False)
     today = gitwire.records.format_ts(ch.clock.now())[:8]
 
     ch.append({"n": 1})
@@ -226,7 +226,7 @@ def test_no_path_creates_a_record_dated_before_today(participant, bare_repo):
 def test_first_failure_does_not_let_later_records_pass(participant, bare_repo):
     """3건 연속 전송 → 1번 push 실패 → 2·3번이 먼저 나가지 않는다."""
     runner = BlockedPushRunner()
-    ch = participant("a", batch_window=3600.0, runner=runner)
+    ch = participant("a", autopublish=False, runner=runner)
     runner.blocked = True                        # 방이 만들어진 뒤에 막는다
 
     one = ch.append({"n": 1})
@@ -263,7 +263,7 @@ def test_queue_is_memory_only_and_dies_with_the_process(
     "죽은 프로세스"는 같은 home·같은 클론을 쓰는 **새 Channel 객체**로 흉내 낸다
     (그 둘이 곧 재기동이 물려받는 전부다 — 메모리는 안 물려받는다).
     """
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     ticket = ch.append({"n": "보내고 바로 죽는다"})
 
     # 디스크에 아무것도 없다 = 물려줄 것이 없다
@@ -273,7 +273,7 @@ def test_queue_is_memory_only_and_dies_with_the_process(
 
     reborn = gitwire.Channel(
         str(bare_repo), home=homes("a"), sender="a",
-        clock=gitwire.FixedOffsetClock(0.0), batch_window=3600.0, auto_archive=False,
+        clock=gitwire.FixedOffsetClock(0.0), autopublish=False, auto_archive=False,
     ).open()
     try:
         assert reborn.flush() == []               # 밀어낼 것이 없다
@@ -289,7 +289,7 @@ def test_close_drops_what_it_could_not_push(participant):
     조용히 영원히 기다리게 두지 않는다 — 기다리는 쪽이 사실을 알아야 한다.
     """
     runner = BlockedPushRunner()
-    ch = participant("a", batch_window=3600.0, runner=runner)
+    ch = participant("a", autopublish=False, runner=runner)
     runner.blocked = True                        # 방이 만들어진 뒤에 막는다
     ticket = ch.append({"n": "종료 때 못 나갈 말"})
 
@@ -307,7 +307,7 @@ def test_close_drops_what_it_could_not_push(participant):
 
 def test_pending_record_contract(participant, bare_repo):
     """티켓은 대기 중에 **id·시각을 지어내지 않는다** (`NotPushed`)."""
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     ticket = ch.append({"n": 1}, sender="bob-x")
 
     assert ticket.sender == gitwire.records.slug_sender("bob-x") == "bob_x"
@@ -331,7 +331,7 @@ def test_pending_record_contract(participant, bare_repo):
 
 def test_append_with_flush_returns_a_settled_ticket(participant):
     """`flush=True` 는 호출 안에서 push 까지 끝낸다 — 티켓이 이미 settled 다."""
-    ch = participant("a", batch_window=3600.0)
+    ch = participant("a", autopublish=False)
     ticket = ch.append({"n": 1}, flush=True)
     assert ticket.pushed is True
     assert gitwire.is_record_id(ticket.id)

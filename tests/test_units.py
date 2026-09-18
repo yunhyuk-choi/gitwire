@@ -375,7 +375,83 @@ def test_git_calls_never_prompt():
     runner = FakeRunner(gitcmd.GitResult(0, "", ""))
     g = gitcmd.Git(runner, Path("."))
     g.run("fetch")
-    assert runner.calls[0][:2] == ["-c", "core.autocrlf=false"]
+    # ⚠️ 앞에 자격증명 설정이 붙을 수 있다(네트워크 호출) — BASE_CONFIG 는
+    # 그 뒤에 **언제나** 온다.
+    assert "core.autocrlf=false" in runner.calls[0]
+    assert runner.calls[0][-1] == "fetch"
+
+
+# ------------------------------------------ 자격증명 조회를 싸게 (네트워크만)
+
+
+def test_credential_config_resets_the_multivalued_list(monkeypatch):
+    """⭐ `credential.helper` 는 다중값이다 — **빈 값으로 초기화한 뒤** 지정해야 한다.
+
+    추가만 하면 기존 사슬(예: 시스템의 GCM)이 그대로 남고, git 은 인증 성공 후
+    `store` 를 사슬 전원에게 보내므로 지우려던 비용이 되돌아온다 (실측:
+    wincred 단독 1220ms → wincred→manager 1519ms).
+    """
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "!echo")   # `!` 형태 = 있다고 믿는다
+    gitcmd.reset_credential_state()
+    args = gitcmd.credential_config("git")
+    assert args[:2] == ("-c", "credential.helper="), args
+    assert args[2:] == ("-c", "credential.helper=!echo"), args
+
+
+def test_credential_config_is_only_for_network_commands(monkeypatch):
+    """로컬 git 호출의 동작은 한 글자도 바뀌지 않는다."""
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "!echo")
+    gitcmd.reset_credential_state()
+    runner = FakeRunner(gitcmd.GitResult(0, "", ""))
+    g = gitcmd.Git(runner, Path("."))
+    g.run("commit", "-m", "x")
+    g.run("push", "origin", "main")
+    assert "credential.helper=" not in runner.calls[0], runner.calls[0]
+    assert "credential.helper=" in runner.calls[1], runner.calls[1]
+
+
+def test_missing_helper_falls_back_to_user_config(monkeypatch):
+    """⚠️ 없는 헬퍼를 강제하면 **아무것도 얹지 않는다** — 느린 것이 깨지는 것보다 낫다."""
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "no-such-helper-xyz")
+    gitcmd.reset_credential_state()
+    assert gitcmd.credential_config("git") == ()
+
+
+def test_credential_helper_can_be_turned_off(monkeypatch):
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "off")
+    gitcmd.reset_credential_state()
+    assert gitcmd.credential_config("git") == ()
+
+
+def test_auth_failure_retries_once_with_the_user_config(monkeypatch):
+    """지정한 저장소에 자격증명이 없으면 **사용자 설정으로 한 번 더** 시도한다.
+
+    (자격증명이 GCM 전용 저장소에만 있는 사람이 깨지지 않는 유일한 이유다.)
+    그리고 그 프로세스에서는 접는다 — 왕복마다 실패를 두 번 내지 않는다.
+    """
+    monkeypatch.setenv(gitcmd.HELPER_ENV, "!echo")
+    gitcmd.reset_credential_state()
+
+    class Flaky(FakeRunner):
+        def run(self, args, *, cwd=None, env=None, timeout=None):
+            self.calls.append(list(args))
+            if "credential.helper=!echo" in args:
+                return gitcmd.GitResult(
+                    128, "", "fatal: could not read Username: terminal prompts disabled"
+                )
+            return gitcmd.GitResult(0, "ok", "")
+
+    runner = Flaky(None)
+    g = gitcmd.Git(runner, Path("."))
+    assert g.run("push", "origin", "main").returncode == 0
+    assert len(runner.calls) == 2
+    assert "credential.helper=!echo" in runner.calls[0]
+    assert "credential.helper=!echo" not in runner.calls[1]
+
+    # 접혔다 — 다음 호출은 처음부터 사용자 설정이다 (실패를 두 번 내지 않는다)
+    g.run("push", "origin", "main")
+    assert len(runner.calls) == 3
+    assert "credential.helper=!echo" not in runner.calls[2]
 
 
 # ------------------------------------------------- Windows 콘솔 창 억제

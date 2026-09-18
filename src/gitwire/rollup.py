@@ -181,7 +181,8 @@ def is_closed(day: str, now: datetime, grace_hours: float = DEFAULT_GRACE_HOURS)
     * 참가자 간 **시계 오차**. gitwire 는 git 호스트의 HTTP `Date` 로 시계를
       맞추므로 잔여 오차는 초 단위다(`clock.py`). 다만 시계 보정에 실패한
       참가자는 로컬 시계로 degraded 동작하므로 분~시간 단위로 어긋날 수 있다.
-    * 발행 **배칭 창**과 push 지연.
+    * 발행 대기열이 밀려 나갈 때까지의 **push 지연**(원격이 느리거나 실패해
+      재시도하는 동안 쌓인 건들 — `Channel._drain`).
 
     2시간이면 위 둘을 넉넉히 덮는다. 더 길게 잡을 이유가 없는 이유는, **그보다
     늦게 도착하는 레코드(시계가 어긋난 참가자의 push)는 유예로 막을 수 있는
