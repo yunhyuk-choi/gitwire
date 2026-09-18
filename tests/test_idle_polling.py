@@ -179,8 +179,8 @@ def test_new_records_still_arrive_after_idle_polls(bare_repo, homes):
         got: list = []
         assert reader.poll_once(got.append) == 1
         assert got[0].payload["i"] == "새 메시지"
-        # 배달 직후의 첫 폴은 캐시를 다시 채우므로 `rev-parse` 가 한 번 남는다
-        # (로컬이 실제로 바뀌었으니 다시 물어보는 것이 맞다). 그 다음부터 유휴다.
+        # 배달 직후의 첫 폴은 캐시를 다시 채운다 — 채우는 값을 `.git` 의 ref
+        # 파일에서 직접 읽으므로(`localrefs.ref_sha`) 그때도 git 이 뜨지 않는다.
         assert reader.poll_once(got.append) == 0
         runner.reset()
         assert reader.poll_once(got.append) == 0
