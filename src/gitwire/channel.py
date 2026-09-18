@@ -1504,7 +1504,16 @@ class Channel:
                     staged = set(self._pending_state)
                     made = self._materialize(batch)   # ⭐ 시각·id·파일
                     plan = self._absorb_plan()        # 흡수할 것을 확정
-                self._commit_plan(plan)               # 커밋 — 채널 락 밖 (④)
+                try:
+                    self._commit_plan(plan)           # 커밋 — 채널 락 밖 (④)
+                except BaseException:
+                    # ⚠️ 커밋이 깨졌다. 찍은 것을 **되돌린다** — 그러지 않으면
+                    # 찍힌 파일이 작업 사본에 남고, 대기열은 그대로이므로 재시도가
+                    # 같은 건을 새 id 로 또 찍어 파일이 쌓인다. 되돌리면 다음
+                    # 시도가 그때의 시각으로 다시 찍는다 (`_rewind`).
+                    with self._lock:
+                        self._rewind(base, made, staged)
+                    raise
                 with self._lock:
                     self._absorb_done(plan)
                     if not made and self._unpushed_count() == 0:

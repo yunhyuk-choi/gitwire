@@ -19,6 +19,7 @@ import pytest
 import gitwire
 from gitwire.clock import FixedOffsetClock
 from gitwire import localrefs
+from gitwire.errors import GitError
 from gitwire.gitcmd import SubprocessGitRunner
 
 SLOW = 1.0
@@ -519,3 +520,38 @@ def test_state_written_during_the_unlocked_commit_still_gets_published(
         assert states["late@localhost"].value == {"cursor": "c2"}
     finally:
         verify.close()
+
+
+def test_a_commit_that_stages_nothing_fails_loudly_and_rewinds(
+    participant, bare_repo, homes
+):
+    """⚠️ 레코드를 찍었는데 커밋에 아무것도 안 실리면 **소리 내어 실패한다.**
+
+    예전에는 `diff --cached --quiet` 로 먼저 묻고 "변경 없음"이면 커밋을 건너뛰었다.
+    그 분기가 이 경우를 **조용히 삼켰다**: 커밋이 없으니 HEAD 는 그대로, push 는
+    "Everything up-to-date" 로 성공, 그리고 대기열은 *나갔다*고 표시된다 —
+    레코드는 작업 사본에 남아 아무도 다시 보지 않는다.
+
+    실제로 여기 걸리는 설정이 있다: 누군가 이 클론의 `.gitignore` 에 `records/`
+    를 넣으면 `git add` 가 아무것도 스테이징하지 못한다.
+
+    지금은 찍은 레코드가 있으면 `git commit` 을 그대로 부르고, 실패를 올린다.
+    그리고 찍은 것을 **되돌린다** — 파일도 지우고 건은 대기열에 남긴다.
+    """
+    a = participant("a", autopublish=False, auto_archive=False)
+    ignore = a.clone_dir / ".gitignore"
+    ignore.write_text(
+        ignore.read_text(encoding="utf-8") + "records/\n", encoding="utf-8"
+    )
+    a.git.run("add", "--", ".gitignore")
+    a.git.run("commit", "-m", "테스트: records/ 를 무시하게 만든다")
+
+    ticket = a.append({"n": 0})
+    with pytest.raises(GitError):
+        a.flush()
+
+    # 되돌렸다 — 찍힌 파일이 남지 않았고, 건은 여전히 대기열에 있다.
+    assert list((a.clone_dir / "records").rglob("*.json")) == []
+    assert ticket.pushed is False and ticket.dropped is False
+    assert a.info()["pending"] == 1, "대기열에서 사라졌다"
+    assert landed(bare_repo, homes) == [], "안 나갔는데 원격에 있다"

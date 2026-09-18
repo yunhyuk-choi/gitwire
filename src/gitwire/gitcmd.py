@@ -147,8 +147,17 @@ def _helper_installed(name: str, git_path: str) -> bool:
 def credential_config(git_path: str = "git") -> tuple[str, ...]:
     """네트워크 git 호출에 얹을 `-c credential.helper=…` 인자 (없으면 빈 튜플).
 
-    왜 — 실측 (Windows 11 · git 2.51 · GitHub private repo · `push --dry-run`
-    5회, 중앙값)::
+    ⭐ **이것은 이제 2단이다.** 1단은 아래 `credential_env()` — 자격증명을 기동 시
+    한 번 읽어 메모리에 들고 쓰는 쪽이고, 그게 되면 헬퍼가 아예 뜨지 않는다
+    (−607ms/왕복). 이 함수가 받는 것은 그 조회가 **안 되는** 환경이다:
+
+    * `credential.useHttpPath=true` 처럼 호스트만으로는 조회가 안 되는 설정 —
+      `git credential fill` 은 빈손으로 오지만 git 자신의 push 중 조회(경로까지
+      포함)는 성공한다. 이 단계가 그 사람의 유일한 경로다.
+    * Basic 헤더를 받지 않는 서버 (사내 게이트웨이·Negotiate 강제).
+
+    그 환경에서는 아래 표가 그대로 유효하다 — 실측 (Windows 11 · git 2.51 ·
+    GitHub private repo · `push --dry-run` 5회, 중앙값)::
 
         사용자 설정 그대로 (system: manager = GCM)      1552 ms
         wincred 만                                      1220 ms
