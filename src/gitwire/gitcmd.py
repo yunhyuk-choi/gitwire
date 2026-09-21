@@ -493,6 +493,14 @@ def creation_flags() -> int:
     ``GCM_INTERACTIVE=never`` 로 어떤 프롬프트도 막고 있으므로 콘솔이 필요한
     경로가 없다.
 
+    ⚠️ "콘솔 없는 프로세스가 콘솔 앱을 부르면 손자가 창을 띄운다"는 일반론이
+    있다 — git 에는 해당하지 않는다는 것을 **실측으로** 확인했다 (2026-09-21):
+    콘솔 없는 ``pythonw.exe`` 에서 이 플래그로 ``git push``(로컬 receive-pack) ·
+    ``fetch``(upload-pack) · ``ls-remote https://``(remote-https) 를 돌리며 5ms
+    마다 최상위 콘솔 창을 열거했다 — Git for Windows 는 자기 자식을 스스로 숨긴
+    콘솔로 띄우므로(창 제목 ``invisible cygwin console``, 전부 비가시) **보이는 창이
+    0개**였고, 플래그를 아예 안 준 대조군에서만 터미널 창이 생겼다.
+
     ``getattr`` 로 읽는다 — 이 이름은 Windows 의 ``subprocess`` 에만 있다. 폴백은
     **Win32 상수 그대로**(0x00000008) 다: 0 으로 두면 POSIX 에서 돌린 테스트가 이
     플래그를 단언할 수 없어 회귀를 놓친다. 이 값은 위 ``os.name`` 분기 안에서만
