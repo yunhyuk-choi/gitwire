@@ -424,8 +424,15 @@ class CountingRunner(SubprocessGitRunner):
         self.calls.clear()
 
 
-def test_a_transfer_spawns_exactly_three_git(participant):
-    """⭐ 전송 한 번 = `add` + `commit` + `push`. 그게 전부다.
+def test_a_transfer_spawns_exactly_one_git(participant):
+    """⭐ 전송 한 번 = `push` 하나. 그게 전부다.
+
+    3개(`add`·`commit`·`push`)였던 것을 `add`+`commit` 을 파이썬이 직접 써서
+    (`nativecommit` — 이 머신 실측 198ms → 3~6ms) 1개로 줄였다. 그 커밋이 git 과
+    같은 바이트인지는 `tests/test_native_commit.py` 가 `git fsck`·`git status`·
+    `write-tree` 로 검산한다. 아래는 그 전 단계(7개 → 3개)의 기록이다.
+
+    예전 = `add` + `commit` + `push`.
 
     예전에는 **7개**였다 — `rev-parse` 2회(기준 HEAD·커밋 후 HEAD)와
     `diff --cached`, `update-ref` 가 더 있었다. git subprocess 한 번은 하는 일과
@@ -447,32 +454,38 @@ def test_a_transfer_spawns_exactly_three_git(participant):
     rec = a.append({"n": 1})
     a.flush()
     assert rec.pushed, "안 나갔다"
-    assert runner.calls == ["add", "commit", "push"], runner.calls
+    assert runner.calls == ["push"], runner.calls
 
 
-class GateOnArmedCommit(SubprocessGitRunner):
-    """`arm()` 한 뒤의 **첫 커밋**을 붙잡아 둔다 (방 초기화 커밋은 통과시킨다)."""
+class GateOnArmedCommit:
+    """`arm()` 한 뒤의 **첫 커밋**을 붙잡아 둔다 (방 초기화 커밋은 통과시킨다).
 
-    def __init__(self) -> None:
-        super().__init__()
+    커밋은 이제 git 프로세스가 아니라 `Channel._commit_native` 다 — 그래서 러너가
+    아니라 그 메서드를 감싼다. 붙잡는 자리(커밋 직전, 채널 락 밖)는 같다.
+    """
+
+    def __init__(self, monkeypatch) -> None:
         self.armed = False
         self.held = False
         self.gate = threading.Event()
         self.go = threading.Event()
+        inner = gitwire.Channel._commit_native
+
+        def gated(channel, plan, base):
+            if self.armed and not self.held:
+                self.held = True
+                self.gate.set()
+                self.go.wait(60)
+            return inner(channel, plan, base)
+
+        monkeypatch.setattr(gitwire.Channel, "_commit_native", gated)
 
     def arm(self) -> None:
         self.armed = True
 
-    def run(self, args, **kw):
-        if self.armed and not self.held and any(a == "commit" for a in args):
-            self.held = True
-            self.gate.set()
-            self.go.wait(60)
-        return super().run(args, **kw)
-
 
 def test_state_written_during_the_unlocked_commit_still_gets_published(
-    participant, bare_repo, homes
+    participant, bare_repo, homes, monkeypatch
 ):
     """⚠️ 커밋을 락 밖에서 하는 대가 — 그 창에 들어온 건을 **아무도 안 밀면** 안 된다.
 
@@ -491,8 +504,8 @@ def test_state_written_during_the_unlocked_commit_still_gets_published(
     이 테스트는 그 성질을 *결과*로 못 박는다: 커밋 한복판에 상태를 하나 넣고,
     **추가로 아무것도 부르지 않은 채** 그것이 커밋되고 원격까지 가는지 본다.
     """
-    runner = GateOnArmedCommit()
-    a = participant("a", runner=runner, auto_archive=False)   # autopublish 기본
+    runner = GateOnArmedCommit(monkeypatch)
+    a = participant("a", auto_archive=False)                  # autopublish 기본
     runner.arm()
     sending = threading.Thread(target=lambda: a.append({"n": 0}), daemon=True)
     sending.start()
@@ -523,7 +536,7 @@ def test_state_written_during_the_unlocked_commit_still_gets_published(
 
 
 def test_a_commit_that_stages_nothing_fails_loudly_and_rewinds(
-    participant, bare_repo, homes
+    participant, bare_repo, homes, monkeypatch
 ):
     """⚠️ 레코드를 찍었는데 커밋에 아무것도 안 실리면 **소리 내어 실패한다.**
 
@@ -537,7 +550,13 @@ def test_a_commit_that_stages_nothing_fails_loudly_and_rewinds(
 
     지금은 찍은 레코드가 있으면 `git commit` 을 그대로 부르고, 실패를 올린다.
     그리고 찍은 것을 **되돌린다** — 파일도 지우고 건은 대기열에 남긴다.
+
+    ⚠️ 이것은 **git 으로 커밋하는 경로**의 성질이다. 기본 경로(`_commit_native`)는
+    `.gitignore` 를 보지 않고 우리가 쓴 레코드를 그대로 커밋하므로 이 사고 자체가
+    없다 (`test_native_commit.py::test_native_commit_ignores_a_stray_gitignore`).
+    여기서는 git 경로를 강제해 그 폴백의 규율을 그대로 지킨다.
     """
+    monkeypatch.setattr(gitwire.Channel, "_commit_native", lambda self, plan, base: None)
     a = participant("a", autopublish=False, auto_archive=False)
     ignore = a.clone_dir / ".gitignore"
     ignore.write_text(

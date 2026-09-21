@@ -22,6 +22,7 @@ from typing import Any, Callable, Sequence
 from . import clock as _clock
 from . import identity, layout, records
 from . import localrefs as _localrefs
+from . import nativecommit as _native
 from . import rollup as _rollup
 from . import state as _state
 from .credentials import Credential, NoCredential
@@ -448,6 +449,8 @@ class Channel:
         self._closing = threading.Event()
         self._opened = False
         self._attempts: dict[str, int] = {}
+        # git 없는 커밋(`nativecommit`)이 어떤 이유로 물러났는지 — 같은 이유는 한 번만 적는다.
+        self._native_fallbacks: set[str] = set()
         # 나열 결과 캐시. 키가 sha(내용 주소)라 stale 이 정의상 불가능하다 —
         # 근거와 크기 제한은 treecache.py 참조.
         self._trees = TreeCache()
@@ -1505,7 +1508,10 @@ class Channel:
                     made = self._materialize(batch)   # ⭐ 시각·id·파일
                     plan = self._absorb_plan()        # 흡수할 것을 확정
                 try:
-                    self._commit_plan(plan)           # 커밋 — 채널 락 밖 (④)
+                    # ⭐ 커밋 — 채널 락 밖 (④). 먼저 **git 없이**(`_commit_native`,
+                    # 프로세스 0개), 그 클론에서 그럴 수 없으면 예전처럼 `add`+`commit`.
+                    native = self._commit_native(plan, base)
+                    committed = native is not None or self._commit_plan(plan)
                 except BaseException:
                     # ⚠️ 커밋이 깨졌다. 찍은 것을 **되돌린다** — 그러지 않으면
                     # 찍힌 파일이 작업 사본에 남고, 대기열은 그대로이므로 재시도가
@@ -1516,9 +1522,11 @@ class Channel:
                     raise
                 with self._lock:
                     self._absorb_done(plan)
-                    if not made and self._unpushed_count() == 0:
+                    # 방금 커밋이 생겼으면 미푸시가 반드시 ≥1 이다 — 세러 가지 않는다
+                    # (`rev-list` 프로세스 하나).
+                    if not made and not committed and self._unpushed_count() == 0:
                         return []
-                    head = self._head_after_commit(base, bool(plan.records))
+                    head = native or self._head_after_commit(base, bool(plan.records))
                 if head is None:
                     with self._lock:
                         self._rewind(base, made, staged)
@@ -1556,6 +1564,54 @@ class Channel:
                     self._settle(batch, made)
                 return list(made)
             return []
+
+    def _commit_native(self, plan: _Absorb, base: str | None) -> str | None:
+        """계획을 **git 없이** 커밋한다 — 성공하면 새 HEAD sha, 못 하면 None (git 으로).
+
+        ⭐ 이 머신 실측: `git add` 83ms + `git commit` 115ms → 이 경로 3~6ms.
+        오브젝트·인덱스·ref·reflog 를 git 과 바이트 단위로 같게 쓰는 것은
+        `nativecommit` 모듈의 책임이고 그 판정 기준(`git fsck` 조용·`git status`
+        깨끗)은 테스트가 못 박는다.
+
+        None 을 돌려주는 경우 — 커밋할 것이 없다 / HEAD 가 아직 없다(unborn) /
+        인덱스 형식을 모른다(v3·v4·필수 확장) / HEAD 가 우리 브랜치가 아니다 /
+        ref·인덱스 락 경합. 전부 "모르면 하지 않는다"이고 호출자는 예전 그대로
+        `_commit_plan` 으로 간다. 이유는 **한 번만** 로그에 남긴다.
+
+        부수효과: 새 HEAD 의 참가자 상태 나열을 캐시에 미리 넣는다 — 우리가 방금
+        그 트리를 만들었으므로 안다 (`_seed_state_index`). chat 이 push 직후
+        `read_state()` 를 부르는데, 그것이 예전에는 `ls-tree` 한 번(64ms)이었다.
+        """
+        if base is None or not (plan.records or plan.states):
+            return None
+        try:
+            files: dict[str, bytes] = {}
+            for rel in (*plan.records, *sorted(plan.states)):
+                files[rel] = (self.clone_dir / rel).read_bytes()
+            done = _native.commit_paths(
+                self.clone_dir, self.branch, base, files, plan.message,
+                _native.identity_from_env(self.author_name, self.author_email, "AUTHOR"),
+                _native.identity_from_env(self.author_name, self.author_email, "COMMITTER"),
+            )
+        except (_native.Unsupported, OSError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            if reason not in self._native_fallbacks:
+                self._native_fallbacks.add(reason)
+                log.info("gitwire: git 없는 커밋을 쓸 수 없어 git 으로 커밋한다 — %s", reason)
+            return None
+        # ref 파일을 우리가 직접 바꿨다 — 스탬프가 잡아내지만 명시적으로 버린다.
+        self._localrefs.invalidate("native commit")
+        self._seed_state_index(done.sha, done.participants)
+        return done.sha
+
+    def _seed_state_index(self, sha: str, entries: Sequence[tuple[str, str]]) -> None:
+        """`_state_index(sha)` 가 물어볼 답을 미리 넣는다 — 형식은 그 함수와 같다."""
+        rows = []
+        for name, blob in entries:
+            who = _state.key_from_path(_state.STATE_DIR + "/" + name)
+            if who:
+                rows.append(f"{blob} {who}")
+        self._trees.put("state:" + sha, sorted(rows, key=lambda r: r.split(" ", 1)[1]))
 
     def _head_after_commit(self, base: str | None, committed: bool) -> str | None:
         """커밋 직후의 HEAD — **한 번 검산한다.** ⚠️ `_lock` 을 쥔 채 부른다.
