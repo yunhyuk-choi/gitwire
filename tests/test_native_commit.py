@@ -229,3 +229,36 @@ def test_tree_body_sorts_like_git():
     ])
     names = [n for n, _, _ in nativecommit.parse_tree(body)]
     assert names == [b"a-b", b"a", b"a0"]
+
+
+def test_polling_after_our_own_push_asks_git_nothing_but_ls_remote(participant):
+    """⭐ 폴러가 *우리가 방금 push 한* 커밋을 만나면 git 을 부르지 않는다 (`_own_diffs`).
+
+    예전에는 그 틱이 `cat-file -e`·`merge-base`·`log --diff-filter=A` 와 `_advance` 의
+    재계산까지 **9개 프로세스(≈500ms)** 를 `_lock` 을 쥔 채 썼다 — 다음 전송의
+    `append()` 가 그 뒤에 줄을 섰다. 답(그 커밋에 실린 레코드)은 우리가 이미 안다.
+    """
+    runner = CountingRunner()
+    a = participant("a", runner=runner, autopublish=False, auto_archive=False)
+    a.skip_to_now()
+    got: list = []
+    a.poll_once(got.append)                     # 유휴 틱 — 기준선
+    rec = a.append({"n": 1})
+    a.flush()
+    runner.calls.clear()
+    n = a.poll_once(got.append)
+    assert n == 1 and [r.id for r in got] == [rec.id]
+    assert runner.calls == ["ls-remote"], runner.calls
+    # 커서가 그 커밋까지 당겨졌다 — 다음 틱은 유휴 경로 (git 은 ls-remote 하나)
+    runner.calls.clear()
+    assert a.poll_once(got.append) == 0
+    assert runner.calls == ["ls-remote"], runner.calls
+
+    # 남의 커밋이 끼면 캐시는 정의상 비켜선다 — 예전 경로로 정확히 배달한다
+    b = participant("b", autopublish=False, auto_archive=False)
+    other = b.append({"n": 2})
+    b.flush()
+    runner.calls.clear()
+    assert a.poll_once(got.append) == 1
+    assert got[-1].id == other.id
+    assert "log" in runner.calls, runner.calls

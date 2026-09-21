@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -451,6 +452,15 @@ class Channel:
         self._attempts: dict[str, int] = {}
         # git 없는 커밋(`nativecommit`)이 어떤 이유로 물러났는지 — 같은 이유는 한 번만 적는다.
         self._native_fallbacks: set[str] = set()
+        # ⭐ 우리가 만든 전이 `(base, head) → 그 사이에 추가된 레코드 경로들`.
+        #
+        # 폴러는 로컬 HEAD 가 바뀌면 "그 사이에 무엇이 추가됐나"를 git 에게 묻는다
+        # (`_plan`: `cat-file -e` · `merge-base --is-ancestor` · `log --diff-filter=A`,
+        # 그리고 `_advance` 의 재계산까지 합쳐 실측 **9개 프로세스 ≈ 500ms**를 `_lock`
+        # 을 쥔 채 쓴다). 그런데 그 전이가 *우리가 방금 커밋해서 push 한 것*이면 답을
+        # 이미 안다 — 그 커밋에 실린 레코드가 전부다. 키가 (base, head) 두 sha 라
+        # 남의 커밋이 끼어든 전이는 정의상 여기 걸리지 않는다. 최근 것만 조금 든다.
+        self._own_diffs: "OrderedDict[tuple[str, str], tuple[str, ...]]" = OrderedDict()
         # 나열 결과 캐시. 키가 sha(내용 주소)라 stale 이 정의상 불가능하다 —
         # 근거와 크기 제한은 treecache.py 참조.
         self._trees = TreeCache()
@@ -1555,6 +1565,7 @@ class Channel:
                         with self._lock:
                             self._mark_pushed(head)
                             self._settle(batch, made)
+                            self._remember_own_diff(base, head, made)
                         return list(made)
                     with self._lock:
                         self._rewind(base, made, staged)
@@ -1562,8 +1573,19 @@ class Channel:
                 with self._lock:
                     self._mark_pushed(head)      # 방금 **실제로** 올린 sha
                     self._settle(batch, made)
+                    self._remember_own_diff(base, head, made)
                 return list(made)
             return []
+
+    _OWN_DIFFS_MAX = 32
+
+    def _remember_own_diff(self, base: str | None, head: str, made: Sequence[records.Record]) -> None:
+        """`base → head` 는 우리 커밋이고 거기 추가된 레코드는 `made` 다. ⚠️ `_lock` 안."""
+        if not base or not head or base == head:
+            return
+        self._own_diffs[(base, head)] = tuple(sorted(r.id for r in made))
+        while len(self._own_diffs) > self._OWN_DIFFS_MAX:
+            self._own_diffs.popitem(last=False)
 
     def _commit_native(self, plan: _Absorb, base: str | None) -> str | None:
         """계획을 **git 없이** 커밋한다 — 성공하면 새 HEAD sha, 못 하면 None (git 으로).
@@ -2219,6 +2241,13 @@ class Channel:
             # (batch_pos > 0) 그 배치를 **같은 목표 커밋으로 재계산**해야 하므로
             # 아래 정상 경로를 그대로 타야 한다.
             return target, [], MODE_DIFF
+        # ⭐ 우리가 방금 push 한 전이면 답을 이미 안다 — git 0개 (`_own_diffs`).
+        # `_advance` 의 재계산(batch_pos > 0, 같은 batch_head)도 같은 키로 맞는다.
+        if base:
+            own_target = cur.batch_head if cur.batch_pos > 0 else target
+            own = self._own_diffs.get((base, own_target)) if own_target else None
+            if own is not None:
+                return own_target, list(own[cur.batch_pos:]), MODE_DIFF
         if (
             cur.batch_pos > 0
             and self._reachable(cur.batch_head)

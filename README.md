@@ -373,8 +373,99 @@ bare 원격으로 BEFORE/AFTER 를 **번갈아** 5라운드 돌린 값(라운드
   읽은 ref 파일이 낡았다) 캐시를 버리고 `rev-parse` 로 다시 묻는다. 그 오판을
   안 잡으면 *예전 sha 를 push 하고 방금 찍은 레코드를 "나갔다"로 표시*한다.
 
-`tests/test_flush_lock.py::test_a_transfer_spawns_exactly_three_git` 가 이
-숫자를 고정한다 — 7개로 되돌아가면 깨진다.
+`tests/test_flush_lock.py::test_a_transfer_spawns_exactly_one_git` 가 이
+숫자를 고정한다 — 아래 절에서 `add`·`commit` 까지 없어져 지금은 **1개**(`push`)다.
+
+### 3개 → 1개 — 전송 2.2초를 ms 로 귀속시키고, 프로세스 기동을 깎았다 (2026-09-21)
+
+사용자 실측: 채팅 앱에서 `POST /messages` → SSE `message`(확정) 가 **2,194~2,264ms**
+였다. 자격증명(왕복당 → 기동당 1회)과 git 호출 수(7 → 3)를 고친 뒤에도 체감이
+그대로였던 이유를 끝내려고, 설치본과 같은 코드(a255058)를 **실제 GitHub 원격의 일회용
+브랜치**에 대해 chat 과 같은 모양(`autopublish=False` + 아웃박스의 `flush()` +
+push 직후 `read_state()`)으로 돌리고 모든 구간을 `perf_counter`·`GIT_TRACE`·
+`GIT_TRACE_CURL` 로 적었다 (이 머신 = SentinelOne EDR 이 도는 Windows 11, 레코드
+2000건 클론, 8회):
+
+| 구간 | 실측 | git 자신이 잰 일 | 남은 것은 무엇인가 |
+|---|---|---|---|
+| `append()` + 파일 쓰기 | 1 ms | — | |
+| `git add` | **167 ms** | 14 ms | 프로세스 기동·종료 — 래퍼 1 + conhost 1 + git 1 |
+| `git commit` | **289 ms** | 93 ms | 위와 같음 + `maintenance run --auto` 자식 1개(~50 ms) |
+| `git push` | **1708 ms** | — | 기동 ~105 → `remote-https` 스폰·exec ~180 → **GET info/refs 366** → `send-pack`·`pack-objects` 스폰 ~170 → **POST git-receive-pack 886** → 종료 ~40 |
+| chat 의 `read_state()` (`ls-tree`) | **130 ms** | 5 ms | 새 HEAD 라 나열 캐시 미스 — 프로세스 기동이 전부 |
+| **합** | **2327 ms** (관측 2168~2334) | | 사용자 실측 2194~2264 와 맞는다 |
+
+**숨어 있던 1초는 "일"이 아니라 프로세스 기동·종료였다.** 방 크기와 무관하다(레코드
+0건 클론에서도 2400ms). 세 겹이 겹쳐 있었다:
+
+1. **PATH 의 `git` 은 래퍼다.** `C:\Program Files\Git\cmd\git.exe` 는 환경을 맞춘
+   뒤 `mingw64\bin\git.exe` 를 **자식으로** 띄운다 → 우리 호출마다 프로세스 2개.
+   `subprocess.run` 실측 `rev-parse HEAD`: 래퍼 91~132 ms · 바이너리 56~61 ms.
+   → `gitcmd.resolve_git_path` 가 파일시스템만 보고(프로세스 0개) 진짜 바이너리로
+   바꾼다. 그 자리에 수 MB 짜리 파일이 실제로 있을 때만 — 모르면 그대로 둔다.
+2. **`CREATE_NO_WINDOW` 는 창만 숨긴 *새 콘솔*이다** — 호출마다 `conhost.exe` 가
+   하나 더 뜬다. `cmd /c exit` 실측: 플래그 0 = 36 ms · `CREATE_NO_WINDOW` = **73 ms** ·
+   `DETACHED_PROCESS` = **33 ms**. 후자는 콘솔을 아예 주지 않고, 출력은 어차피
+   파이프라 잃는 것이 없다. → `gitcmd.creation_flags()` 가 `DETACHED_PROCESS` 를 준다.
+3. **`gc.auto=0` 으로는 `maintenance run --auto` 자식이 안 없어진다.** 그 자식이
+   "할 일 없음"을 판정할 뿐 뜨는 것은 그대로다 (GIT_TRACE 에 커밋마다 1개).
+   → `-c maintenance.auto=false`.
+
+그리고 프로세스 기동이 값이라면 **부르지 않는 것**이 답이다:
+
+4. **`add`+`commit` 을 git 없이** (`nativecommit.py`) — blob·tree·commit 오브젝트,
+   stat 까지 채운 v2 인덱스, `<ref>.lock` CAS 로 ref, reflog 를 파이썬이 git 과
+   **같은 바이트로** 쓴다. 실측 198 ms → **18~22 ms** (인덱스 2000항목 읽고 다시
+   쓰기 포함). 판정은 git 이 한다: `git fsck --strict` 조용 · `git status --porcelain`
+   빈 출력 · `git write-tree` == `HEAD^{tree}` · `git log --stat` 정상
+   (`tests/test_native_commit.py`). **모르면 하지 않는다** — HEAD 가 우리 브랜치가
+   아니거나, 인덱스가 v3/v4·필수 확장을 가졌거나, ref 락 경합이면 예전 그대로
+   `add`+`commit`(테스트로 고정).
+   덤으로 새 HEAD 의 `participants/` 나열을 캐시에 미리 넣는다 — 우리가 그 트리를
+   만들었으므로 안다. chat 이 push 직후 부르는 `read_state()` 가 130 ms → 2 ms.
+5. **폴러가 우리 커밋을 만났을 때** — 다음 틱은 로컬 HEAD 가 바뀐 것을 보고 "그
+   사이에 무엇이 추가됐나"를 git 에게 물었다 (`cat-file -e`·`merge-base`·
+   `log --diff-filter=A` + `_advance` 의 재계산 = **9개 프로세스 ≈ 500 ms 를 `_lock`
+   을 쥔 채**). 다음 전송의 `append()` 가 그 뒤에 줄을 섰다 — "연속으로 보내면 더
+   느리다"의 한 원인. 그 전이 `(base, head)` 가 우리가 방금 push 한 것이면 답(그
+   커밋의 레코드)을 이미 안다 → `_own_diffs`, git 0개. 키가 두 sha 라 남의 커밋이
+   낀 전이는 정의상 걸리지 않는다.
+
+덤으로 잡힌 것: `localrefs.write_ref` 가 Windows 텍스트 모드 `os.open` 으로 ref 를
+**CRLF(42바이트)** 로 쓰고 있었다 — `git fsck` 가 `trailingRefContent` 경고를 냈다.
+`O_BINARY` 로 고쳤다.
+
+결과 (같은 조건, 실제 GitHub, 중앙값):
+
+| | a255058 | ①②③ | ①~⑤ |
+|---|---|---|---|
+| `git add` | 167 | 83 | **0** (네이티브 커밋 전체 18~22) |
+| `git commit` | 289 | 115 | **0** |
+| `git push` | 1708 | 1660 | 1631 |
+| chat 의 `read_state` | 130 | 64 | **2** |
+| **전송 1건 `append → 착지 → read_state`** (n=8) | **2327** | 1947 | **1656** |
+| chat `RoomManager.send()` → SSE `message` (n=6, 진짜 chat 코드) | 2556 | — | **1670** |
+| 연속 3건 `append → 착지` (0.3초 간격) | 2343 / 5137 / 4837 | — | 1946 / 3532 / 3231 |
+| 프로세스 / 전송 (git + 래퍼 + conhost) | 9 + 4 + 4 = **17** | 8 | **5** (전부 `push` 안) |
+
+**남은 1656 ms 는 `git push` 1631 ms 다**, 그 안은 프로세스 5개 기동·종료 ≈ **290** ·
+`GET info/refs?service=git-receive-pack` **359** · `POST git-receive-pack` **978**(GitHub
+서버의 receive-pack — 우리가 못 깎는다) · 나머지 ~5. 목표 1.2초에 못 미친 것은 이
+push 때문이고, 다음 단계는 push 도 git 없이 하는 것이다:
+
+*(설계만 — 구현은 결정 뒤)* **smart-HTTP `git-receive-pack` 을 파이썬이 직접**:
+① 오브젝트는 우리가 방금 썼으므로 pack(PACK v2 헤더 + zlib 오브젝트 + sha1)을 그대로
+만든다 (thin 협상 불필요 — 커밋 1·트리 2~3·blob 1). ② `refs/remotes/origin/<branch>` 가
+곧 서버의 현재 sha 다 (push 마다 갱신하고 폴러가 `ls-remote` 로 확인한다) → **GET
+info/refs 를 생략**하고 `old new refs/heads/<branch>\0report-status agent=…` 한 줄 +
+pack 을 POST 한다. 서버가 `ng`(ref 가 움직였다)를 주면 그때만 GET 뒤 재시도 = 지금의
+`PushRejected` → fetch → 재찍기 경로와 같다. ③ 연결을 keep-alive 로 들고 TLS 를
+재사용한다. ④ 자격증명은 지금의 `HeldCredential` 헤더 그대로(argv·URL 에 안 실린다).
+⑤ 성공 뒤 `refs/remotes/origin/<branch>`·reflog 를 우리가 쓴다(`localrefs.write_ref`).
+예상: 프로세스 290 + GET 359 = **−650 ms** → push ≈ **980~1050 ms** → 전송 1건 ≈
+**1.0~1.1초** (목표 1.2 안). 위험: GitHub 의 receive-pack 협상 세부(side-band, 대용량
+응답), 프록시·사내 게이트웨이, 실패 후 `_landed` 확인 경로 유지, 그리고 git 이 안
+하는 일(추적 ref·reflog)을 우리가 빠짐없이 하는 것.
 
 ### 자격증명 조회 비용 — 기동 시 한 번만 읽어 메모리에 들고 쓴다
 
@@ -757,10 +848,11 @@ diff --name-only -z ...                      ┘
 
 git subprocess 한 번은 **하는 일과 무관하게 약 494KB 를 읽고 65~73회의 읽기
 연산**을 낸다(위 「나열 캐시」의 42~48ms 와 같은 이야기 — 비용은 작업이 아니라
-프로세스 기동이다: 바이너리·DLL·설정·인덱스를 매번 다시 읽는다). ⚠️ Windows 에서
-콘솔 창을 없애려고 `CREATE_NO_WINDOW` 를 걸었으므로 git 하나마다 **`conhost.exe`
-가 함께** 뜬다 — 호출 하나의 값이 두 배다(창 억제를 포기할 이유는 아니다.
-호출을 줄이는 이유일 뿐이다).
+프로세스 기동이다: 바이너리·DLL·설정·인덱스를 매번 다시 읽는다). ⚠️ 이 측정 당시에는
+Windows 에서 콘솔 창을 없애려고 `CREATE_NO_WINDOW` 를 걸었으므로 git 하나마다
+**`conhost.exe` 가 함께** 떴다 — 호출 하나의 값이 두 배였다. 지금은 `DETACHED_PROCESS`
+로 콘솔을 아예 주지 않아 conhost 가 뜨지 않고, PATH 의 `git` 래퍼도 거치지 않는다
+(「3개 → 1개」 절). 그래도 호출을 줄이는 이유는 그대로다.
 
 **적응형 폴링(유휴 시 주기를 늘리기)은 택하지 않았다.** 그건 체감 지연을 파는
 것이다. 지연을 그대로 두고 읽기만 줄이는 길이 있으면 그쪽이 먼저다.
