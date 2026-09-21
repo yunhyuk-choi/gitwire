@@ -460,7 +460,7 @@ def test_auth_failure_retries_once_with_the_user_config(monkeypatch):
 
 
 def test_windows_git_is_spawned_without_a_console_window(monkeypatch):
-    """⭐ Windows 에서 ``CREATE_NO_WINDOW`` 가 **실제 호출에** 걸려 있어야 한다.
+    """⭐ Windows 에서 ``DETACHED_PROCESS`` 가 **실제 호출에** 걸려 있어야 한다.
 
     이 단언이 없으면 플래그가 빠져도 아무 테스트가 깨지지 않는다 — 콘솔 없는
     프로세스(``pythonw.exe`` 로 띄운 앱·서비스)에서 git 호출마다 빈 창이
@@ -481,9 +481,14 @@ def test_windows_git_is_spawned_without_a_console_window(monkeypatch):
     monkeypatch.setattr(gitcmd.subprocess, "run", fake_run)
     result = gitcmd.SubprocessGitRunner().run(["status"], timeout=5.0)
 
-    expected = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    expected = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
     assert seen["kwargs"]["creationflags"] & expected == expected, (
-        "git 이 CREATE_NO_WINDOW 없이 떠 있다 — 콘솔 없는 부모에서 빈 창이 깜빡인다"
+        "git 이 DETACHED_PROCESS 없이 떠 있다 — 콘솔 없는 부모에서 빈 창이 깜빡인다"
+    )
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    assert seen["kwargs"]["creationflags"] & no_window == 0, (
+        "CREATE_NO_WINDOW 는 창만 숨긴 새 콘솔(conhost.exe)을 호출마다 만든다 — "
+        "DETACHED_PROCESS 로 콘솔 자체를 주지 않는다 (gitcmd.creation_flags 도크)"
     )
     # 창을 없앤 대신 잃은 것이 없어야 한다.
     assert seen["kwargs"]["capture_output"] is True, "출력 캡처가 이 라이브러리의 근간이다"

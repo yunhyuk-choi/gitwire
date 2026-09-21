@@ -30,10 +30,12 @@ Windows — 왜 창 억제 플래그가 필요한가
 사라졌다. ``python.exe`` 로 띄웠을 때는 git 이 그 콘솔을 조용히 물려받아 **안
 보였을 뿐**, 같은 일이 계속 일어나고 있었다.
 
-그래서 **``CREATE_NO_WINDOW``** 를 건다 — 자식은 콘솔을 갖되 **창이 없는** 콘솔을
-갖는다. 창이 없으므로 (1) 깜빡이지 않고 (2) 사용자가 그 창을 닫아 git 을 죽일 수도
-없다. 콘솔 자체는 있으므로 git 이 다시 부르는 손자(자격증명 헬퍼 등)도 그 창 없는
-콘솔을 물려받는다 — 한 곳만 고쳐도 트리 전체가 조용해진다.
+그래서 **``DETACHED_PROCESS``** 를 건다 — 자식은 콘솔을 **갖지 않는다.** 창이
+없으므로 (1) 깜빡이지 않고 (2) 사용자가 그 창을 닫아 git 을 죽일 수도 없다. git 이
+다시 부르는 손자(자격증명 헬퍼 등)도 콘솔 없이 뜬다 — 한 곳만 고쳐도 트리 전체가
+조용해진다. (처음에는 ``CREATE_NO_WINDOW`` 였다 — 창만 숨긴 **새 콘솔**을 주는
+플래그라 호출마다 ``conhost.exe`` 가 함께 떠 약 40ms 를 더 냈다. `creation_flags`
+도크에 실측이 있다.)
 
 ⚠️ ``DETACHED_PROCESS`` 는 이 문제의 답이 아니다. 그건 "콘솔을 아예 주지 않는다"는
 뜻이라 **손자가 다시 자기 콘솔을 창과 함께 할당한다** — 문제를 한 세대 미룬다.
@@ -71,6 +73,12 @@ BASE_CONFIG: tuple[str, ...] = (
     "-c", "core.safecrlf=false",
     "-c", "commit.gpgsign=false",
     "-c", "gc.auto=0",
+    # ⭐ `commit`·`fetch` 뒤에 git 이 `git maintenance run --auto` 를 **자식
+    # 프로세스로** 띄운다 — `gc.auto=0` 은 그 자식이 *할 일이 없다*고 판정하게
+    # 할 뿐, 자식이 뜨는 것 자체는 막지 못한다 (GIT_TRACE 실측: 커밋마다
+    # `run_command: git maintenance run --auto --no-quiet --detach` 1개, 이 머신
+    # 에서 ~50ms). 이 키가 그 스폰을 막는다 (`commit --allow-empty` 124→77ms).
+    "-c", "maintenance.auto=false",
     "-c", "advice.detachedHead=false",
 )
 
@@ -472,14 +480,27 @@ def creation_flags() -> int:
     ``os.name`` 을 **부를 때** 보므로 테스트가 다른 OS 를 흉내 낼 수 있고,
     (2) 이 값이 어디서 오는지 한 곳으로 좁혀지기 때문이다.
 
-    ``getattr`` 로 읽는다 — ``CREATE_NO_WINDOW`` 는 Windows 의 ``subprocess``
-    에만 있는 이름이다. 폴백은 **Win32 상수 그대로**(0x08000000) 다: 0 으로
-    두면 POSIX 에서 돌린 테스트가 이 플래그를 단언할 수 없어 회귀를 놓친다.
-    이 값은 위 ``os.name`` 분기 안에서만 쓰이므로 POSIX 실행에는 새지 않는다.
+    ⭐ 값은 ``DETACHED_PROCESS`` 다 (``CREATE_NO_WINDOW`` 가 아니다). 둘 다 창을
+    없애지만 값이 다르다 — ``CREATE_NO_WINDOW`` 는 자식에게 **새 콘솔을 만들어
+    주되 창만 숨기는** 것이라 호출마다 ``conhost.exe`` 가 하나 더 뜬다.
+    ``DETACHED_PROCESS`` 는 콘솔을 **아예 주지 않는다** — 출력은 어차피 파이프로
+    받으므로 잃는 것이 없고 conhost 가 뜨지 않는다. 이 머신 실측
+    (subprocess.run ``cmd /c exit``, n=12 중앙값): 플래그 0 = 36ms ·
+    CREATE_NO_WINDOW = **73ms** · DETACHED_PROCESS = **33ms**. git 한 호출당
+    약 −40ms, 전송 한 번(호출 3~4개)에 −120~160ms.
+
+    자격증명 헬퍼 등 git 의 자식도 콘솔 없이 뜬다 — 우리는 ``GIT_TERMINAL_PROMPT=0``
+    ``GCM_INTERACTIVE=never`` 로 어떤 프롬프트도 막고 있으므로 콘솔이 필요한
+    경로가 없다.
+
+    ``getattr`` 로 읽는다 — 이 이름은 Windows 의 ``subprocess`` 에만 있다. 폴백은
+    **Win32 상수 그대로**(0x00000008) 다: 0 으로 두면 POSIX 에서 돌린 테스트가 이
+    플래그를 단언할 수 없어 회귀를 놓친다. 이 값은 위 ``os.name`` 분기 안에서만
+    쓰이므로 POSIX 실행에는 새지 않는다.
     """
     if os.name != "nt":
         return 0
-    return getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    return getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -514,11 +535,77 @@ class GitRunner(Protocol):
         ...
 
 
+_resolve_lock = threading.Lock()
+_resolved: dict[str, str] = {}
+
+#: Git for Windows 설치 루트 아래에서 **진짜** git 바이너리가 있는 자리 (래퍼가 아닌 것).
+_GFW_REAL_GIT = ("mingw64/bin/git.exe", "mingw32/bin/git.exe")
+#: 래퍼는 수십 KB, 진짜 git.exe 는 수 MB 다. 이 아래면 래퍼로 본다.
+_REAL_GIT_MIN_BYTES = 1_000_000
+
+
+def resolve_git_path(git_path: str = "git") -> str:
+    r"""Windows 에서 PATH 의 `git` 이 **래퍼**면 진짜 바이너리 경로로 바꾼다. 다른 OS 는 그대로.
+
+    ⭐ 왜 — Git for Windows 의 PATH 항목은 `C:\Program Files\Git\cmd` 이고 거기
+    있는 `git.exe` 는 환경을 맞춘 뒤 `mingw64\bin\git.exe` 를 **자식 프로세스로**
+    띄우는 래퍼다. 그래서 우리가 `git` 이라고 부르는 모든 호출이 프로세스 **2개**다.
+    이 머신(EDR 이 도는 Windows 11) 실측(subprocess.run 기준, n=12 중앙값)::
+
+        cmd\git.exe rev-parse HEAD            91~132 ms
+        mingw64\bin\git.exe rev-parse HEAD    56~ 61 ms      ← 호출당 약 −40~70 ms
+
+    전송 한 번이 git 을 3~4번 부르므로 이것만으로 −150~250 ms 다.
+
+    판정은 **파일시스템만** 본다(프로세스 0개): `shutil.which` 로 찾은 파일이
+    `cmd\` 또는 `bin\` 아래의 작은 파일이면 설치 루트의 `mingw64\bin\git.exe`
+    (또는 `mingw32`)를 쓴다. 그 자리에 **수 MB 짜리 파일이 실제로 있을 때만**
+    바꾼다 — 레이아웃을 모르면 손대지 않고 원래 값을 그대로 쓴다 (느릴 뿐 틀리지
+    않는다). 결과는 프로세스 안에서 한 번만 계산한다.
+    """
+    if os.name != "nt":
+        return git_path
+    with _resolve_lock:
+        hit = _resolved.get(git_path)
+    if hit is not None:
+        return hit
+    result = git_path
+    found = git_path if os.path.isabs(git_path) else shutil.which(git_path)
+    if found:
+        result = found
+        try:
+            p = Path(found)
+            small = p.stat().st_size < _REAL_GIT_MIN_BYTES
+            if p.name.lower() == "git.exe" and p.parent.name.lower() in ("cmd", "bin") and small:
+                root = p.parent.parent
+                for rel in _GFW_REAL_GIT:
+                    cand = root / rel
+                    if cand.is_file() and cand.stat().st_size >= _REAL_GIT_MIN_BYTES:
+                        result = str(cand)
+                        break
+        except OSError:
+            result = found
+    with _resolve_lock:
+        first = git_path not in _resolved
+        _resolved[git_path] = result
+    if first and result != git_path:
+        log.info("gitwire: git 바이너리를 직접 부른다 — %s (PATH 의 %r 는 래퍼다)", result, git_path)
+    return result
+
+
 class SubprocessGitRunner:
-    """실제 git 바이너리를 subprocess 로 부르는 기본 구현."""
+    """실제 git 바이너리를 subprocess 로 부르는 기본 구현.
+
+    `git_path` 는 **첫 호출 때** `resolve_git_path` 로 확정한다 (생성만으로
+    파일시스템을 보지 않는다 — 러너는 테스트·CLI 에서 자주 만들어진다).
+    """
 
     def __init__(self, git_path: str = "git") -> None:
-        self.git_path = git_path
+        self._git_path = git_path
+
+    @property
+    def git_path(self) -> str:
+        return resolve_git_path(self._git_path)
 
     def run(
         self,
