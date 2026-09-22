@@ -21,13 +21,14 @@ import pytest
 import gitwire
 from gitwire.clock import FixedOffsetClock
 
+from conftest import NO_WINDOW
+
 
 def commit_count(clone: Path) -> int:
     out = subprocess.run(
         ["git", "rev-list", "--count", "HEAD"],
         cwd=str(clone), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=True,
-    )
+        encoding="utf-8", errors="replace", check=True, **NO_WINDOW)
     return int(out.stdout.strip())
 
 
@@ -42,8 +43,7 @@ def test_empty_repo_becomes_a_room(bare_repo, participant):
     ls = subprocess.run(
         ["git", "--git-dir", str(bare_repo), "ls-tree", "-r", "--name-only", "main"],
         capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=True,
-    ).stdout
+        encoding="utf-8", errors="replace", check=True, **NO_WINDOW).stdout
     assert "gitwire.json" in ls
     assert ".gitattributes" in ls
 
@@ -419,18 +419,17 @@ def _seed_repo(bare_repo: Path, tmp_path: Path, files: dict) -> str:
     """bare 레포에 내용을 하나 넣어 둔다 (이미 쓰고 있는 레포를 흉내낸다)."""
     work = tmp_path / "seed"
     subprocess.run(["git", "clone", str(bare_repo), str(work)], check=True,
-                   capture_output=True)
+                   capture_output=True, **NO_WINDOW)
     for name, text in files.items():
         path = work / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="\n")
     for args in (["add", "-A"], ["commit", "-m", "기존 내용"],
                  ["push", "origin", "HEAD:refs/heads/main"]):
-        subprocess.run(["git", *args], cwd=str(work), check=True, capture_output=True)
+        subprocess.run(["git", *args], cwd=str(work), check=True, capture_output=True, **NO_WINDOW)
     return subprocess.run(
         ["git", f"--git-dir={bare_repo}", "rev-parse", "main"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+        capture_output=True, text=True, check=True, **NO_WINDOW).stdout.strip()
 
 
 def test_refuses_to_turn_a_repo_with_content_into_a_channel(bare_repo, tmp_path, homes):
@@ -451,13 +450,11 @@ def test_refuses_to_turn_a_repo_with_content_into_a_channel(bare_repo, tmp_path,
     # ⭐ 지상검증 — 원격이 **한 글자도** 바뀌지 않았다.
     after = subprocess.run(
         ["git", f"--git-dir={bare_repo}", "rev-parse", "main"],
-        capture_output=True, text=True, check=True,
-    ).stdout.strip()
+        capture_output=True, text=True, check=True, **NO_WINDOW).stdout.strip()
     assert after == before, "거부했다면서 원격에 커밋을 올렸다"
     listing = subprocess.run(
         ["git", f"--git-dir={bare_repo}", "ls-tree", "-r", "--name-only", "main"],
-        capture_output=True, text=True, check=True,
-    ).stdout
+        capture_output=True, text=True, check=True, **NO_WINDOW).stdout
     assert "gitwire.json" not in listing
 
 

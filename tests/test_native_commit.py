@@ -17,12 +17,13 @@ from gitwire import localrefs, nativecommit
 from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import SubprocessGitRunner
 
+from conftest import NO_WINDOW
+
 
 def git(*args: str, cwd: Path) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    )
+        encoding="utf-8", errors="replace", **NO_WINDOW)
     assert proc.returncode == 0, f"git {' '.join(args)} 실패 rc={proc.returncode}: {proc.stderr}"
     return proc.stdout
 
@@ -42,7 +43,7 @@ def _assert_git_agrees(clone: Path, head: str) -> None:
     assert git("rev-parse", "HEAD", cwd=clone).strip() == head
     assert git("status", "--porcelain", cwd=clone) == "", "작업 사본·인덱스가 HEAD 와 어긋났다"
     fsck = subprocess.run(["git", "fsck", "--strict", "--no-dangling"], cwd=str(clone),
-                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+                          capture_output=True, text=True, encoding="utf-8", errors="replace", **NO_WINDOW)
     # ⚠️ 경고도 안 된다 — 예컨대 ref 파일에 CRLF 를 쓰면 `trailingRefContent` 경고가 난다
     # (Windows 텍스트 모드 `os.open` 이 실제로 그렇게 했다).
     assert fsck.returncode == 0 and (fsck.stdout + fsck.stderr).strip() == "", fsck.stdout + fsck.stderr

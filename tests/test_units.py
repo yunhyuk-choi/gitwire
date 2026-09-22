@@ -18,6 +18,8 @@ from gitwire.treecache import TreeCache
 from gitwire.cursor import Cursor, CursorStore
 from gitwire.errors import AuthError, GitError, PushRejected
 
+from conftest import NO_WINDOW
+
 
 # --------------------------------------------------------------- records
 
@@ -598,17 +600,17 @@ def _repo(path: Path) -> None:
         ["config", "user.email", "t@localhost"],
         ["config", "user.name", "t"],
     ):
-        subprocess.run(["git", *args], cwd=str(path), check=True, capture_output=True)
+        subprocess.run(["git", *args], cwd=str(path), check=True, capture_output=True, **NO_WINDOW)
 
 
 def _commit_one(path: Path) -> str:
     (path / "f").write_text("x", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(path), check=True,
-                   capture_output=True)
+                   capture_output=True, **NO_WINDOW)
     subprocess.run(["git", "commit", "-q", "-m", "one"], cwd=str(path), check=True,
-                   capture_output=True)
+                   capture_output=True, **NO_WINDOW)
     res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(path), check=True,
-                         capture_output=True, text=True)
+                         capture_output=True, text=True, **NO_WINDOW)
     return res.stdout.strip()
 
 
@@ -623,10 +625,10 @@ def test_ref_sha_matches_rev_parse_loose_packed_and_detached(tmp_path):
 
     assert localrefs.ref_sha(tmp_path) == (True, want)       # loose ref
     subprocess.run(["git", "pack-refs", "--all"], cwd=str(tmp_path), check=True,
-                   capture_output=True)
+                   capture_output=True, **NO_WINDOW)
     assert localrefs.ref_sha(tmp_path) == (True, want)       # packed-refs
     subprocess.run(["git", "checkout", "-q", "--detach", "HEAD"], cwd=str(tmp_path),
-                   check=True, capture_output=True)
+                   check=True, capture_output=True, **NO_WINDOW)
     assert localrefs.ref_sha(tmp_path) == (True, want)       # detached HEAD
 
 
@@ -644,7 +646,7 @@ def test_write_ref_is_visible_to_git(tmp_path):
     sha = _commit_one(tmp_path)
     assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", sha) is True
     res = subprocess.run(["git", "rev-parse", "refs/gitwire/pushed"],
-                         cwd=str(tmp_path), check=True, capture_output=True, text=True)
+                         cwd=str(tmp_path), check=True, capture_output=True, text=True, **NO_WINDOW)
     assert res.stdout.strip() == sha
     assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", sha) is True  # 덮어쓰기
     assert localrefs.write_ref(tmp_path, "refs/gitwire/pushed", "nope") is False

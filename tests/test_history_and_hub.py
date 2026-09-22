@@ -16,13 +16,14 @@ import gitwire
 from gitwire.clock import FixedOffsetClock
 from gitwire.errors import HistoryRewritten
 
+from conftest import NO_WINDOW
+
 
 def commit_count(clone: Path) -> int:
     out = subprocess.run(
         ["git", "rev-list", "--count", "HEAD"],
         cwd=str(clone), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=True,
-    )
+        encoding="utf-8", errors="replace", check=True, **NO_WINDOW)
     return int(out.stdout.strip())
 
 
@@ -136,8 +137,7 @@ def second_bare(tmp_path):
     repo.mkdir()
     subprocess.run(
         ["git", "init", "--bare", "-b", "main", str(repo)],
-        check=True, capture_output=True,
-    )
+        check=True, capture_output=True, **NO_WINDOW)
     return repo
 
 
