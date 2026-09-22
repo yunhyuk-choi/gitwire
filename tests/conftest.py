@@ -23,11 +23,28 @@ from gitwire import gitcmd  # noqa: E402
 from gitwire.clock import FixedOffsetClock  # noqa: E402
 
 
+# ---------------------------------------------------------- 창 억제 (Windows)
+
+#: 테스트가 띄우는 자식에게 **콘솔을 주지 않는다.**
+#:
+#: ⚠️ 이건 제품이 아니라 *테스트 하네스* 의 결함이었다. 콘솔이 없는 부모
+#: (에이전트 셸·pythonw GUI 런처)에서 pytest 를 돌리면, 플래그 없이 스폰한
+#: 콘솔 프로그램은 자기 콘솔을 **새로 할당**하고 Windows 11 기본 콘솔 호스트가
+#: 그것을 **창으로 띄운다** — 실측: `tests/test_cli.py` 하나에서 보이는 창
+#: 92개(Windows Terminal + PseudoConsoleWindow 쌍). 터미널에서 직접 돌리면
+#: 자식이 부모 콘솔을 물려받아 창이 없으므로 여태 보이지 않았다.
+#:
+#: 규율은 제품(`gitcmd.creation_flags`)과 같다 — `DETACHED_PROCESS`.
+NO_WINDOW: dict = (
+    {"creationflags": getattr(subprocess, "DETACHED_PROCESS", 0x00000008)}
+    if os.name == "nt" else {}
+)
+
+
 def git(*args: str, cwd: Path) -> str:
     proc = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-        encoding="utf-8", errors="replace", check=True
-    )
+        encoding="utf-8", errors="replace", check=True, **NO_WINDOW)
     return proc.stdout
 
 
@@ -66,8 +83,7 @@ def bare_repo(tmp_path: Path) -> Path:
     subprocess.run(
         ["git", "init", "--bare", "-b", "main", str(repo)],
         check=True,
-        capture_output=True,
-    )
+        capture_output=True, **NO_WINDOW)
     return repo
 
 
@@ -121,5 +137,4 @@ def run_cli(env, *args: str) -> subprocess.CompletedProcess:
         capture_output=True,
         text=True,
         encoding="utf-8",
-        env=env,
-    )
+        env=env, **NO_WINDOW)

@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-from conftest import run_cli
+from conftest import NO_WINDOW, run_cli
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -197,8 +197,7 @@ def test_payload_from_stdin(bare_repo, tmp_path, cli_env):
         [sys.executable, "-m", "gitwire", "append", "--repo", str(bare_repo),
          "--home", str(home), "--payload-file", "-"],
         input='{"from":"stdin"}', capture_output=True, text=True,
-        encoding="utf-8", env=cli_env,
-    )
+        encoding="utf-8", env=cli_env, **NO_WINDOW)
     assert proc.returncode == EXIT_OK, proc.stderr
     p = run_cli(cli_env, "fetch", "--repo", str(bare_repo), "--home", str(home),
                 "--consumer", "r")

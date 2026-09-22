@@ -35,6 +35,8 @@ import gitwire
 from gitwire.errors import NotPushed
 from gitwire.gitcmd import GitResult, SubprocessGitRunner
 
+from conftest import NO_WINDOW
+
 DAY = 86400.0
 
 
@@ -68,8 +70,7 @@ def remote_ids(bare_repo: Path) -> list[str]:
     """원격에 **정말** 있는 레코드 id (클론도 캐시도 거치지 않는다)."""
     out = subprocess.run(
         ["git", "ls-tree", "-r", "--name-only", "main"],
-        cwd=str(bare_repo), capture_output=True, text=True, encoding="utf-8",
-    )
+        cwd=str(bare_repo), capture_output=True, text=True, encoding="utf-8", **NO_WINDOW)
     if out.returncode != 0:
         return []
     return sorted(
@@ -123,8 +124,7 @@ def test_stamp_is_taken_at_push_not_at_append(participant, bare_repo):
     # 원격에 실제로 올라간 **파일 내용**의 시각도 같다 (봉투를 직접 읽는다)
     body = subprocess.run(
         ["git", "show", f"main:{rec.id}"], cwd=str(bare_repo),
-        capture_output=True, text=True, encoding="utf-8", check=True,
-    ).stdout
+        capture_output=True, text=True, encoding="utf-8", check=True, **NO_WINDOW).stdout
     assert f'"ts":"{push_day[:4]}-{push_day[4:6]}-{push_day[6:]}' in body, body
     assert "composed_at" not in body, "작성 시각을 남기지 않기로 했다"
 

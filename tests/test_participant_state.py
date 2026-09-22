@@ -37,6 +37,8 @@ from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import SubprocessGitRunner
 from gitwire import localrefs
 
+from conftest import NO_WINDOW
+
 
 class CountingRunner(SubprocessGitRunner):
     """git 호출을 하위명령별로 센다 (`test_idle_polling.py` 와 같은 도구)."""
@@ -57,8 +59,7 @@ def _git_bare(repo: Path, *args: str) -> str:
     """bare 레포에 직접 git 을 건다 (`--git-dir` 명시 — safe.bareRepository 대비)."""
     proc = subprocess.run(
         ["git", f"--git-dir={repo}", *args], cwd=str(repo), capture_output=True,
-        text=True, encoding="utf-8", errors="replace",
-    )
+        text=True, encoding="utf-8", errors="replace", **NO_WINDOW)
     if proc.returncode != 0:
         raise AssertionError(f"git {args} 실패: {proc.stderr.strip()}")
     return proc.stdout.strip()

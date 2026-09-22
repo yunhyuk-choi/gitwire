@@ -127,6 +127,9 @@ _SHA_RE = re.compile(r"\A[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 #: symref 사슬을 따라갈 최대 깊이. 실전에서는 1(`HEAD` → `refs/heads/x`)이다.
 _MAX_SYMREF = 4
 
+#: Windows 에서만 있는 플래그 — 다른 OS 는 0 (모든 파일이 바이너리다).
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 
 def gitdir(clone_dir: Path) -> Path | None:
     """ref 파일을 **직접 읽어도 되는** `.git` 인가. 아니면 None (= git 에게 물어라).
@@ -229,7 +232,11 @@ def write_ref(clone_dir: Path, name: str, sha: str) -> bool:
     lock = gd / (name + ".lock")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        # ⚠️ `O_BINARY` — Windows 의 `os.open` 은 기본이 텍스트 모드라 LF 를 CRLF 로
+        # 바꿔 쓴다. git 은 그 ref 를 읽기는 하지만 `git fsck` 가 `trailingRefContent`
+        # 경고를 낸다 (실측 — 이 함수가 쓴 `refs/gitwire/pushed` 가 42바이트였다).
+        # ref 파일은 `<sha>` + LF, 정확히 41바이트다.
+        fd = os.open(str(lock), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o666)
     except OSError:
         # ⚠️ 락을 못 얻었다 (남이 쥐고 있거나 쓸 수 없는 곳이다). **그 파일에
         # 손대지 않는다** — 남의 락을 치우면 그쪽 ref 갱신이 깨진다.

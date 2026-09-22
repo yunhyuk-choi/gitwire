@@ -34,6 +34,8 @@ from gitwire import localrefs
 from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import GitResult, SubprocessGitRunner
 
+from conftest import NO_WINDOW
+
 
 class StepClock:
     offset = 0.0
@@ -92,8 +94,7 @@ def _git(cwd: Path, *args: str) -> str:
     """
     proc = subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True,
-        encoding="utf-8", errors="replace",
-    )
+        encoding="utf-8", errors="replace", **NO_WINDOW)
     if proc.returncode != 0:
         raise AssertionError(
             f"git {' '.join(args)} (cwd={cwd}) 실패 {proc.returncode}: "

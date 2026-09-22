@@ -25,6 +25,8 @@ import gitwire
 from gitwire.clock import FixedOffsetClock
 from gitwire.gitcmd import SubprocessGitRunner
 
+from conftest import NO_WINDOW
+
 
 class StepClock:
     offset = 0.0
@@ -241,8 +243,7 @@ def test_폴링이_원격을_기다리는_동안에도_로컬_읽기가_돈다(b
 def _local_helpers(clone: Path) -> list[str]:
     out = subprocess.run(
         ["git", "config", "--local", "--get-all", "credential.helper"],
-        cwd=str(clone), capture_output=True, text=True, encoding="utf-8",
-    )
+        cwd=str(clone), capture_output=True, text=True, encoding="utf-8", **NO_WINDOW)
     return out.stdout.splitlines()
 
 
@@ -257,8 +258,7 @@ def test_credential_helpers_are_opt_in_and_local_only(bare_repo, homes):
     # 사용자의 global 에 helper 가 이미 있다고 하자.
     # (conftest 가 GIT_CONFIG_GLOBAL 을 tmp 파일로 격리해 둔다 — 진짜 설정이 아니다.)
     subprocess.run(
-        ["git", "config", "--global", "credential.helper", "manager"], check=True
-    )
+        ["git", "config", "--global", "credential.helper", "manager"], check=True, **NO_WINDOW)
     on = gitwire.Channel(
         str(bare_repo), home=homes("on"), sender="bob",
         clock=FixedOffsetClock(0.0), credential_helpers=gitwire.credential_cache(60),
@@ -277,8 +277,7 @@ def test_credential_helpers_are_opt_in_and_local_only(bare_repo, homes):
         # 사용자의 global 은 그대로다 — 우리가 고치는 것은 이 클론뿐이다.
         got = subprocess.run(
             ["git", "config", "--global", "--get-all", "credential.helper"],
-            capture_output=True, text=True, encoding="utf-8",
-        )
+            capture_output=True, text=True, encoding="utf-8", **NO_WINDOW)
         assert got.stdout.splitlines() == ["manager"]
     finally:
         on.close()
